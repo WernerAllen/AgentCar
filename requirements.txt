@@ -1,0 +1,25 @@
+# AgentCar - 多车编队强化学习项目依赖
+# Python 3.10+ 推荐
+
+# 核心RL框架
+stable_baselines3>=2.7.0
+gymnasium>=1.2.0
+
+# 深度学习
+torch>=2.0.0  # 建议安装CUDA版本: pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# 科学计算
+numpy>=2.0.0
+scipy>=1.10.0
+
+# 可视化
+matplotlib>=3.8.0
+
+# 工具
+tqdm>=4.60.0
+PyYAML>=6.0
+
+# 可选：物理仿真（如需MuJoCo环境）
+# mujoco>=3.0.0
+# glfw>=2.0.0
+# PyOpenGL>=3.1.0

@@ -1,0 +1,18 @@
+CURRICULUM LEARNING SUMMARY
+==================================================
+
+Output Directory: outputs\curriculum_20260124_134455
+Start Stage: 0
+Base Model: models/pretrain_bc
+
+Results:
+  Stage 1 (s4_center_small): x=151.6m, reward=1639.5 [PASS]
+    Model: outputs\curriculum_20260124_134455\stage1_s4_center_small\best_model.zip
+  Stage 2 (s1s2_mixed): x=151.9m, reward=990.4 [PASS]
+    Model: outputs\curriculum_20260124_134455\stage2_s1s2_mixed\best_model.zip
+  Stage 3 (s5_center_large): x=151.3m, reward=1761.2 [PASS]
+    Model: outputs\curriculum_20260124_134455\stage3_s5_center_large\best_model.zip
+  Stage 4 (s3_narrow): x=10.0m, reward=-427.9 [FAIL]
+    Model: outputs\curriculum_20260124_134455\stage4_s3_narrow\best_model.zip
+  Stage 5 (s6_very_narrow): x=12.5m, reward=-360.6 [FAIL]
+    Model: outputs\curriculum_20260124_134455\stage5_s6_very_narrow\best_model.zip

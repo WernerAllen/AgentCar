@@ -1,0 +1,47 @@
+[
+  {
+    "stage": 1,
+    "scenario": "s4_center_small",
+    "model_path": "outputs\\curriculum_20260124_134455\\stage1_s4_center_small\\best_model.zip",
+    "final_x": 151.6078678292423,
+    "total_reward": 1639.4734141122826,
+    "collision": false,
+    "steps": 1819
+  },
+  {
+    "stage": 2,
+    "scenario": "s1s2_mixed",
+    "model_path": "outputs\\curriculum_20260124_134455\\stage2_s1s2_mixed\\best_model.zip",
+    "final_x": 151.89293131577614,
+    "total_reward": 990.3763287887883,
+    "collision": false,
+    "steps": 1793
+  },
+  {
+    "stage": 3,
+    "scenario": "s5_center_large",
+    "model_path": "outputs\\curriculum_20260124_134455\\stage3_s5_center_large\\best_model.zip",
+    "final_x": 151.32272421551576,
+    "total_reward": 1761.2428176209803,
+    "collision": false,
+    "steps": 1806
+  },
+  {
+    "stage": 4,
+    "scenario": "s3_narrow",
+    "model_path": "outputs\\curriculum_20260124_134455\\stage4_s3_narrow\\best_model.zip",
+    "final_x": 9.954510786037117,
+    "total_reward": -427.9260958286393,
+    "collision": true,
+    "steps": 71
+  },
+  {
+    "stage": 5,
+    "scenario": "s6_very_narrow",
+    "model_path": "outputs\\curriculum_20260124_134455\\stage5_s6_very_narrow\\best_model.zip",
+    "final_x": 12.543048775703515,
+    "total_reward": -360.5959141091504,
+    "collision": true,
+    "steps": 97
+  }
+]

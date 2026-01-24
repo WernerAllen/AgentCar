@@ -1,0 +1,33 @@
+# AgentCar - Conda环境配置
+# 使用方法: conda env create -f environment.yml
+# 检测时间: 2026-01-24
+name: rl_car
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10.19
+  - pip>=23.0
+  
+  # PyTorch (CUDA 12.8) - RTX 5060 Ti
+  - pytorch=2.10.0
+  - pytorch-cuda=12.8
+  - torchvision
+  - torchaudio
+  
+  # 科学计算
+  - numpy=2.2.6
+  - scipy>=1.10.0
+  - matplotlib>=3.8.0
+  
+  # 工具
+  - tqdm
+  - pyyaml
+  
+  # pip安装的包
+  - pip:
+    - stable_baselines3==2.7.1
+    - gymnasium==1.2.3
