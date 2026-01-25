@@ -135,6 +135,13 @@ class FormationRLEnv(gym.Env):
         
         # 碰撞预测距离
         self.collision_check_dist = 20.0  # 前方20m内检测（提前触发）
+
+        # 通道检测前视距离（过早触发会导致提前收缩/碰撞）
+        self.narrow_lookahead = 8.0
+        self.very_narrow_lookahead = 10.0
+        # 前车追尾缓冲距离（仅在收缩/极窄模式启用）
+        self.front_buffer_dist = 1.6
+        self.follow_brake_dist = 2.8
         
         # 轨迹记录
         self.trajectories = [[] for _ in range(num_cars)]
@@ -218,7 +225,7 @@ class FormationRLEnv(gym.Env):
             # 优先级4修复：自适应平滑因子
             # 窄道时需要更快响应(α=0.5)，宽道时更平滑(α=0.3)
             avg_x = np.mean([car.x for car in self.cars])
-            upper_b, lower_b = self._get_passage_bounds(avg_x, lookahead=15.0)
+            upper_b, lower_b = self._get_passage_bounds(avg_x, lookahead=self.narrow_lookahead)
             pw = upper_b - lower_b
             adaptive_alpha = 0.5 if pw < 2.1 else self.smooth_factor  # 窄道时α更大
             self.delta_accumulator = (1 - adaptive_alpha) * self.delta_accumulator + \
@@ -264,10 +271,14 @@ class FormationRLEnv(gym.Env):
         
         # 检测通道宽度，动态调整DWA参数
         avg_x = np.mean([car.x for car in self.cars])
-        is_very_narrow, _passage_width = self._detect_very_narrow_passage(avg_x)
+        is_very_narrow, _passage_width = self._detect_very_narrow_passage(
+            avg_x, lookahead=self.very_narrow_lookahead
+        )
         
         # 优先级1修复：窄道时降低速度+增大前视，给横向调整更多时间
-        upper_bound_global, lower_bound_global = self._get_passage_bounds(avg_x, lookahead=15.0)
+        upper_bound_global, lower_bound_global = self._get_passage_bounds(
+            avg_x, lookahead=self.narrow_lookahead
+        )
         passage_width_global = upper_bound_global - lower_bound_global
         formation_width = 1.6  # 原始队形宽度
         is_narrow_passage = passage_width_global < formation_width + 0.5  # 通道<2.1m时触发
@@ -275,13 +286,11 @@ class FormationRLEnv(gym.Env):
         if is_narrow_passage and not is_very_narrow:
             # 窄道模式：增大前视距离，让DWA有更多时间横移
             base_lookahead = 5.0
-            # 临时降低DWA最小速度
-            for controller in self.dwa_controllers:
-                controller.params.min_speed = 0.4  # 0.8 -> 0.4
+            base_min_speed = 0.4
+        elif is_very_narrow:
+            base_min_speed = 0.3
         else:
-            # 恢复正常参数
-            for controller in self.dwa_controllers:
-                controller.params.min_speed = 0.8
+            base_min_speed = 0.8
         
         dwa_fallback_count = 0  # 初始化DWA回退计数
         for i, car in enumerate(self.cars):
@@ -292,6 +301,15 @@ class FormationRLEnv(gym.Env):
                     if j != i and other.x > car.x:  # 前方队友
                         dist = other.x - car.x
                         front_teammate_dist = min(front_teammate_dist, dist)
+
+            # 收缩/极窄模式下：根据前车距离动态降低最小速度，避免追尾
+            min_speed = base_min_speed
+            if is_narrow_passage or is_very_narrow:
+                if front_teammate_dist < self.front_buffer_dist:
+                    min_speed = 0.0
+                elif front_teammate_dist < self.follow_brake_dist:
+                    min_speed = min(min_speed, 0.2)
+            self.dwa_controllers[i].params.min_speed = min_speed
 
             # 计算本车的前视距离
             if is_very_narrow:
@@ -355,14 +373,15 @@ class FormationRLEnv(gym.Env):
                     dy = other.y - car.y
                     dist = np.sqrt(dx**2 + dy**2)
                     
-                    # 前方队友不阻挡追赶
+                    # 前方队友不阻挡追赶（但过近时仍需避碰）
                     is_front_teammate = dx > 1.0
+                    front_too_close = is_contracting and (0.0 < dx < self.front_buffer_dist)
                     
                     # 判断是否同排队友（前左/前右 或 后左/后右）
                     same_row = abs(self.formation_params.template_offsets[i][0] - 
                                    self.formation_params.template_offsets[j][0]) < 0.5
                     
-                    if dist < 5.0 and not is_front_teammate:
+                    if dist < 5.0 and (not is_front_teammate or front_too_close):
                         # 收缩模式下的同排队友：已有目标间距硬约束(0.64m)，DWA不需要再避
                         # 这是关键修复：解决DWA可行解不足的问题
                         if is_contracting and same_row:
@@ -377,10 +396,6 @@ class FormationRLEnv(gym.Env):
                         else:
                             teammate_radius = base_radius
                             predicted_y = other.y
-                        
-                        # 前方队友：DWA不需要避开前方车
-                        if is_contracting and dx > 0.3:
-                            continue
                         
                         car_obs = Obstacle(
                             x=other.x, y=predicted_y,
@@ -618,7 +633,7 @@ class FormationRLEnv(gym.Env):
         
         # 检测前方通道（提前15m规划）
         avg_x = np.mean([car.x for car in self.cars])
-        upper_bound, lower_bound = self._get_passage_bounds(avg_x, lookahead=15.0)
+        upper_bound, lower_bound = self._get_passage_bounds(avg_x, lookahead=self.narrow_lookahead)
         passage_width = upper_bound - lower_bound
         passage_center = (upper_bound + lower_bound) / 2
         
@@ -851,7 +866,7 @@ class FormationRLEnv(gym.Env):
         
         # ========== 目标点越界惩罚（让RL学会收缩） ==========
         # 优先级3修复：使用安全修正后的target_positions，确保奖励与执行对齐
-        upper_bound, lower_bound = self._get_passage_bounds(avg_x, lookahead=15.0)
+        upper_bound, lower_bound = self._get_passage_bounds(avg_x, lookahead=self.narrow_lookahead)
         passage_width = upper_bound - lower_bound
         
         # 只有当通道宽度小于队形宽度时才启用此惩罚（窄道场景）
@@ -946,7 +961,9 @@ class FormationRLEnv(gym.Env):
         positions = np.array([[car.x, car.y] for car in self.cars])
         
         # ===== 极窄通道检测：一字长蛇阵模式 =====
-        is_very_narrow, passage_width = self._detect_very_narrow_passage(avg_x)
+        is_very_narrow, passage_width = self._detect_very_narrow_passage(
+            avg_x, lookahead=self.very_narrow_lookahead
+        )
         info['is_very_narrow'] = is_very_narrow
         info['passage_width'] = passage_width
         
@@ -1036,7 +1053,7 @@ class FormationRLEnv(gym.Env):
                 return True
         return False
     
-    def _detect_very_narrow_passage(self, current_x: float, lookahead: float = 20.0) -> Tuple[bool, float]:
+    def _detect_very_narrow_passage(self, current_x: float, lookahead: float = 10.0) -> Tuple[bool, float]:
         """
         检测前方是否有极窄通道（需要一字长蛇阵的场景）
         
