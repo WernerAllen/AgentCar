@@ -8,7 +8,7 @@ from stable_baselines3 import PPO
 from formation_rl_env import FormationRLEnv
 
 
-def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: int = 500):
+def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: int = 2500):
     """可视化测试模型"""
     
     print(f"\n{'='*60}")
@@ -61,9 +61,8 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     print(f"Total Reward: {total_reward:.1f}")
     print(f"Status: {'Collision' if terminated else 'Success/Truncated'}")
     
-    # 绘制轨迹（上方轨迹图 + 下方编队状况图）
-    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(20, 8), height_ratios=[1, 0.6],
-                                   gridspec_kw={'hspace': 0.3})
+    # 绘制轨迹图（单图，更长比例）
+    fig, ax = plt.subplots(1, 1, figsize=(24, 6))
     
     # 小车实际尺寸
     car_length = 0.45
@@ -97,15 +96,19 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
             ax.add_patch(end_rect)
             
             # ===== 中间快照机制 =====
-            # 在轨迹的多个位置绘制圆形标记点（在长轨迹上也可见）
+            # 在轨迹的多个位置绘制小车矩形轮廓
             snapshot_ratios = [0.25, 0.5, 0.75]
             for ratio in snapshot_ratios:
                 idx = int(len(xs) * ratio)
                 if 0 < idx < len(xs) - 1:
-                    # 使用大圆形标记点而非小矩形
-                    ax.scatter(xs[idx], ys[idx], s=100, c=colors[i], 
-                              edgecolors='black', linewidths=1.5, zorder=7,
-                              marker='o', alpha=0.8)
+                    # 使用小车矩形轮廓（与起点/终点一致）
+                    snap_rect = Rectangle(
+                        (xs[idx] - car_length/2, ys[idx] - car_width/2),
+                        car_length, car_width,
+                        facecolor=colors[i], alpha=0.6, edgecolor='black', 
+                        linewidth=1, zorder=6
+                    )
+                    ax.add_patch(snap_rect)
     
     # 绘制起点编队框（虚线矩形标注2x2编队）
     start_xs = [traj[0][0] for traj in trajectories if traj]
@@ -178,39 +181,15 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=12)
     ax.grid(True, alpha=0.3)
     
-    # ===== 下方子图：编队状况图 =====
-    # 显示4辆车的Y坐标随X变化，直观展示编队收缩过程
-    for i, traj in enumerate(trajectories):
-        if traj:
-            xs, ys = zip(*traj)
-            ax2.plot(xs, ys, color=colors[i], linestyle=linestyles[i],
-                    label=f'Car {i}', linewidth=1.5, alpha=0.9)
-    
-    # 绘制通道边界参考线
-    ax2.axhline(y=road_hw, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
-    ax2.axhline(y=-road_hw, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
-    ax2.axhline(y=0, color='gray', linestyle=':', linewidth=1, alpha=0.5)  # 中心线
-    
-    # 标记快照位置的垂直线
-    for ratio, snap_color in zip([0.25, 0.5, 0.75], ['green', 'orange', 'red']):
-        if trajectories[0]:
-            idx = int(len(trajectories[0]) * ratio)
-            if 0 < idx < len(trajectories[0]):
-                snap_x = trajectories[0][idx][0]
-                ax2.axvline(x=snap_x, color=snap_color, linestyle=':', linewidth=1.5, alpha=0.6)
-    
-    # 设置坐标轴
-    ax2.set_xlim(ax.get_xlim())
-    ax2.set_ylim(-road_hw - 0.5, road_hw + 0.5)
-    ax2.set_xlabel('X (m)', fontsize=14)
-    ax2.set_ylabel('Y Position (m)', fontsize=14)
-    ax2.set_title('Formation Status - Car Y Positions vs X', fontsize=14)
-    ax2.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=10)
-    ax2.grid(True, alpha=0.3)
-    
     plt.tight_layout()
-    plt.savefig(f'test_result_{scenario}.png', dpi=150, bbox_inches='tight')
-    print(f"\nSaved: test_result_{scenario}.png")
+    
+    # 保存到test_results文件夹
+    import os
+    save_dir = os.path.join(os.path.dirname(__file__), 'test_results')
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'test_result_{scenario}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved: {save_path}")
     plt.show()
     
     env.close()

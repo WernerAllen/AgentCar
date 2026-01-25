@@ -139,9 +139,21 @@ class FormationRLEnv(gym.Env):
         # 通道检测前视距离（过早触发会导致提前收缩/碰撞）
         self.narrow_lookahead = 8.0
         self.very_narrow_lookahead = 10.0
+        self.very_narrow_exit_margin = 6.0
+        self.very_narrow_recover_dist = 8.0
         # 前车追尾缓冲距离（仅在收缩/极窄模式启用）
         self.front_buffer_dist = 1.6
         self.follow_brake_dist = 2.8
+
+        # 极窄通道状态（用于跨门保持纵队）
+        self._very_narrow_active = False
+        self._very_narrow_seen = False
+        self._very_narrow_exit_x = None
+        self._very_narrow_min_width = float('inf')
+        self._last_is_very_narrow = False
+        self._last_very_narrow_width = float('inf')
+        self._very_narrow_recover_alpha = 1.0
+        self._build_very_narrow_segments()
         
         # 轨迹记录
         self.trajectories = [[] for _ in range(num_cars)]
@@ -176,6 +188,11 @@ class FormationRLEnv(gym.Env):
         self._last_target_adjustment_max = 0.0
         self._last_target_adjustment_count = 0
         self._last_dwa_fallback_count = 0
+        self._very_narrow_active = False
+        self._very_narrow_seen = False
+        self._last_is_very_narrow = False
+        self._last_very_narrow_width = float('inf')
+        self._very_narrow_recover_alpha = 1.0
         
         # 重置累积修正量（4维dy）
         self.delta_accumulator = np.zeros(4, dtype=np.float32)
@@ -271,9 +288,32 @@ class FormationRLEnv(gym.Env):
         
         # 检测通道宽度，动态调整DWA参数
         avg_x = np.mean([car.x for car in self.cars])
-        is_very_narrow, _passage_width = self._detect_very_narrow_passage(
+        detected_very_narrow, passage_width = self._detect_very_narrow_passage(
             avg_x, lookahead=self.very_narrow_lookahead
         )
+        if detected_very_narrow:
+            self._very_narrow_active = True
+            self._very_narrow_seen = True
+        if self._very_narrow_active and self._very_narrow_exit_x is not None:
+            if avg_x > self._very_narrow_exit_x:
+                self._very_narrow_active = False
+
+        is_very_narrow = self._very_narrow_active or detected_very_narrow
+        if is_very_narrow and not detected_very_narrow:
+            passage_width = self._very_narrow_min_width
+        self._last_is_very_narrow = is_very_narrow
+        self._last_very_narrow_width = passage_width
+        recover_alpha = 1.0
+        if (not is_very_narrow) and self._very_narrow_seen and self._very_narrow_exit_x is not None:
+            recover_end_x = self._very_narrow_exit_x + self.very_narrow_recover_dist
+            recover_alpha = np.clip(
+                (avg_x - self._very_narrow_exit_x) / max(self.very_narrow_recover_dist, 1e-3),
+                0.0,
+                1.0
+            )
+            if avg_x > recover_end_x:
+                recover_alpha = 1.0
+        self._very_narrow_recover_alpha = recover_alpha
         
         # 优先级1修复：窄道时降低速度+增大前视，给横向调整更多时间
         upper_bound_global, lower_bound_global = self._get_passage_bounds(
@@ -332,8 +372,8 @@ class FormationRLEnv(gym.Env):
                 
                 # 目标y：强制收拢到中心线（通道中心是y=0）
                 # RL的delta_y作为微调，但范围缩小
-                dwa_target_y = 0.0 + self.delta_accumulator[i] * 0.3
-                dwa_target_y = np.clip(dwa_target_y, -0.40, 0.40)  # 限制在通道内（S6更稳妥：±0.40）
+                dwa_target_y = 0.0 + self.delta_accumulator[i] * 0.2
+                dwa_target_y = np.clip(dwa_target_y, -0.25, 0.25)  # 极窄通道更强力收拢
             else:
                 # 正常模式
                 lookahead = base_lookahead
@@ -352,7 +392,14 @@ class FormationRLEnv(gym.Env):
                     elif front_teammate_dist < 6.0:
                         # 前方队友距离尚可，轻微减速
                         lookahead = min(lookahead, 3.5)
-                dwa_target_y = target_positions[i, 1]
+                recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
+                if recover_alpha < 1.0:
+                    # 极窄退出后的缓慢过渡：逐步恢复到2x2队形
+                    recover_limit = 0.25 + 0.55 * recover_alpha  # 0.25 -> 0.80
+                    blended_y = target_positions[i, 1] * recover_alpha
+                    dwa_target_y = np.clip(blended_y, -recover_limit, recover_limit)
+                else:
+                    dwa_target_y = target_positions[i, 1]
                 
                 # 注意：移除_safe_target_y的强制修正
                 # 让RL通过奖励信号自己学习收缩队形，而不是靠后处理
@@ -408,7 +455,11 @@ class FormationRLEnv(gym.Env):
             state = (car.x, car.y, car.theta, car.v)
             goal = (dwa_target_x, dwa_target_y)
             # 极窄通道模式下，preferred_y也用dwa_target_y，避免目标冲突
-            preferred_y = dwa_target_y if is_very_narrow else target_positions[i, 1]
+            recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
+            if is_very_narrow or recover_alpha < 1.0:
+                preferred_y = dwa_target_y
+            else:
+                preferred_y = target_positions[i, 1]
             a, delta = self.dwa_controllers[i].compute(state, goal, nearby_obs, preferred_y)
 
             debug_info = self.dwa_controllers[i].get_debug_info()
@@ -961,9 +1012,12 @@ class FormationRLEnv(gym.Env):
         positions = np.array([[car.x, car.y] for car in self.cars])
         
         # ===== 极窄通道检测：一字长蛇阵模式 =====
-        is_very_narrow, passage_width = self._detect_very_narrow_passage(
-            avg_x, lookahead=self.very_narrow_lookahead
-        )
+        is_very_narrow = getattr(self, "_last_is_very_narrow", False)
+        passage_width = getattr(self, "_last_very_narrow_width", float('inf'))
+        if not is_very_narrow:
+            is_very_narrow, passage_width = self._detect_very_narrow_passage(
+                avg_x, lookahead=self.very_narrow_lookahead
+            )
         info['is_very_narrow'] = is_very_narrow
         info['passage_width'] = passage_width
         
@@ -1005,14 +1059,18 @@ class FormationRLEnv(gym.Env):
             # alpha: 0(安全) ~ 1(危险)
             
             # 动态权重：危险时允许变形，但保持位置跟随
-            w_shape = 0.2  # v4.4权重（危险时允许变形）
-            w_scale = 0.1 * (1.0 - alpha) + 0.05 * alpha  # v4.4权重
+            w_shape = 0.25 * (1.0 - alpha) + 0.15 * alpha  # 安全时更强调形状
+            w_scale = 0.15 * (1.0 - alpha) + 0.05 * alpha
             # 关键修复：危险时也要保持position惩罚，让RL跟随动态ideal收缩
             # 原来：w_pos = 0.5*(1-alpha) + 0*alpha，导致alpha=1时w_pos=0
             # 现在：危险时仍保持0.3的权重，确保收缩信号
-            w_pos = 0.5 * (1.0 - alpha) + 0.3 * alpha
+            w_pos = 0.9 * (1.0 - alpha) + 0.35 * alpha
             
             formation_penalty = w_shape * shape_error + w_scale * scale_error + w_pos * position_error
+            recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
+            if recover_alpha < 1.0:
+                # 极窄退出后的缓冲期：逐步恢复队形惩罚
+                formation_penalty *= (0.3 + 0.7 * recover_alpha)
             
             reward -= formation_penalty
             info['formation_penalty'] = formation_penalty
@@ -1024,7 +1082,7 @@ class FormationRLEnv(gym.Env):
             # ========== 5. 队形恢复奖励 ==========
             # 当安全(alpha<0.2)且队形接近理想时，给予额外奖励
             if alpha < 0.2 and np.sqrt(position_error) < 0.3:
-                recovery_bonus = 1.0
+                recovery_bonus = 2.0
                 reward += recovery_bonus
                 info['recovery_bonus'] = recovery_bonus
             else:
@@ -1052,6 +1110,43 @@ class FormationRLEnv(gym.Env):
             if 0 < rel_x < distance:
                 return True
         return False
+
+    def _build_very_narrow_segments(self) -> None:
+        """预计算极窄通道区间，用于跨门保持纵队"""
+        self._very_narrow_segments = []
+        upper_obs = [
+            obs for obs in self.obstacles
+            if obs.width > 0 and obs.height > 0 and obs.y > 0
+        ]
+        lower_obs = [
+            obs for obs in self.obstacles
+            if obs.width > 0 and obs.height > 0 and obs.y < 0
+        ]
+
+        for upper in upper_obs:
+            upper_start = upper.x - upper.width / 2
+            upper_end = upper.x + upper.width / 2
+            for lower in lower_obs:
+                lower_start = lower.x - lower.width / 2
+                lower_end = lower.x + lower.width / 2
+
+                overlap = min(upper_end, lower_end) - max(upper_start, lower_start)
+                if overlap < -0.5:
+                    continue
+
+                passage_width = (upper.y - upper.height / 2) - (lower.y + lower.height / 2)
+                if passage_width < 1.5:
+                    start_x = min(upper_start, lower_start)
+                    end_x = max(upper_end, lower_end)
+                    self._very_narrow_segments.append((start_x, end_x, passage_width))
+
+        if self._very_narrow_segments:
+            self._very_narrow_exit_x = max(end for _, end, _ in self._very_narrow_segments)
+            self._very_narrow_exit_x += self.very_narrow_exit_margin
+            self._very_narrow_min_width = min(width for _, _, width in self._very_narrow_segments)
+        else:
+            self._very_narrow_exit_x = None
+            self._very_narrow_min_width = float('inf')
     
     def _detect_very_narrow_passage(self, current_x: float, lookahead: float = 10.0) -> Tuple[bool, float]:
         """

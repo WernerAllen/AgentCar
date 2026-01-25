@@ -1098,14 +1098,31 @@ def run_single_narrow_test(
         ax.add_patch(rect)
     
     colors = ['red', 'blue', 'green', 'orange']
+    
+    # 找到窄门处的快照位置（x≈20m）
+    snapshot_idx = None
+    if traj[0]:
+        for idx, (x, y) in enumerate(traj[0]):
+            if x >= 20.0:
+                snapshot_idx = idx
+                break
+    
     for i, t in enumerate(traj):
         if t:
             xs, ys = zip(*t)
-            ax.plot(xs, ys, color=colors[i], label=f'Car {i}', linewidth=1.5)
+            # 轨迹用实线
+            ax.plot(xs, ys, color=colors[i], linestyle='-', label=f'Car {i}', linewidth=1.5, alpha=0.7)
+            # 起点车辆
             ax.add_patch(Rectangle((xs[0]-car_length/2, ys[0]-car_width/2), car_length, car_width,
                                     facecolor=colors[i], alpha=0.9, edgecolor='black', zorder=5))
+            # 终点车辆
             ax.add_patch(Rectangle((xs[-1]-car_length/2, ys[-1]-car_width/2), car_length, car_width,
                                     facecolor=colors[i], alpha=0.5, edgecolor='black', linestyle='--', zorder=5))
+            # 窄门处快照
+            if snapshot_idx and snapshot_idx < len(t):
+                sx, sy = t[snapshot_idx]
+                ax.add_patch(Rectangle((sx-car_length/2, sy-car_width/2), car_length, car_width,
+                                        facecolor=colors[i], alpha=0.7, edgecolor='black', linewidth=1.5, zorder=6))
     
     ax.set_xlim(0, max_x + 1)
     ax.set_ylim(-road_half_width - 0.5, road_half_width + 0.5)
