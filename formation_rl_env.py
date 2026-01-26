@@ -325,15 +325,26 @@ class FormationRLEnv(gym.Env):
             # 窄道模式：强制保持2x2矩形队形，只允许整体偏移
             # 像Wide Gate那样保持队形形状，只进行压缩
             
-            # 1. 计算RL期望的队形整体偏移（取所有车偏移的平均值）
-            rl_center_offset = np.mean(target_positions[:, 1]) - np.mean(ideal_positions[:, 1])
-            # 压缩整体偏移量，窄道时不需要大幅偏移
-            center_offset = rl_center_offset * 0.3
+            # 1. 计算通道中心和理想队形中心
+            passage_center = (upper_bound_global + lower_bound_global) / 2
+            ideal_center = np.mean(ideal_positions[:, 1])
             
-            # 2. 强制队形跟随理想位置（已包含压缩） + 整体偏移
-            target_positions[:, 1] = ideal_positions[:, 1] + center_offset
+            # 2. 计算RL期望的整体偏移（用于微调）
+            rl_center_offset = np.mean(target_positions[:, 1]) - ideal_center
+            # 允许一定的整体偏移，但要限制幅度
+            center_offset = np.clip(rl_center_offset * 0.2, -0.3, 0.3)
             
-            # 3. 确保同排间距严格保持矩形形状
+            # 3. 队形中心 = 通道中心 + RL微调
+            formation_center = passage_center + center_offset
+            
+            # 4. 强制所有车跟随理想队形的相对位置，但中心移到formation_center
+            for i in range(self.num_cars):
+                # 计算该车相对于理想队形中心的偏移
+                relative_offset = ideal_positions[i, 1] - ideal_center
+                # 应用到新的队形中心
+                target_positions[i, 1] = formation_center + relative_offset
+            
+            # 5. 确保同排间距严格保持矩形形状（双重保证）
             for row in self._row_groups:
                 if len(row) < 2:
                     continue
@@ -1197,22 +1208,33 @@ class FormationRLEnv(gym.Env):
     
     def _detect_very_narrow_passage(self, current_x: float, lookahead: float = 10.0) -> Tuple[bool, float]:
         """
-        检测前方是否有极窄通道（需要一字长蛇阵的场景）
+        检测是否在极窄通道区域内（需要一字长蛇阵的场景）
         
-        极窄通道设计：两侧都有障碍物，中间只留窄缝
-        - 上侧障碍物：y ∈ [0.3, 2.5]
-        - 下侧障碍物：y ∈ [-2.5, -0.3]
-        - 通道：y ∈ [-0.3, 0.3]，宽度0.6m
+        改进：使用预计算的极窄区间，在多个障碍物之间也保持极窄模式
         
         Returns:
             (is_very_narrow, passage_width)
-            - is_very_narrow: 是否检测到极窄通道
-            - passage_width: 通道宽度（如果检测到）
+            - is_very_narrow: 是否在极窄通道区域内
+            - passage_width: 通道宽度
         """
-        # v5.0修复：基于实际通道宽度检测，而不是硬编码场景名称
-        # 这样任何场景中出现极窄通道都能正确处理
+        # 方法1：检查是否在预计算的极窄区间内（包括提前量和滞后量）
+        pre_margin = 5.0   # 提前进入极窄模式的距离
+        post_margin = 3.0  # 离开障碍物后保持极窄模式的距离
         
-        # 检测前方是否有成对的障碍物（上下两侧）
+        for start_x, end_x, width in self._very_narrow_segments:
+            if current_x >= start_x - pre_margin and current_x <= end_x + post_margin:
+                return True, width
+        
+        # 方法2：如果有多个极窄区间，检查是否在它们之间
+        # 例如 s6_very_narrow 有两个障碍物组，在它们之间也应保持极窄模式
+        if len(self._very_narrow_segments) >= 2:
+            first_end = min(end for _, end, _ in self._very_narrow_segments)
+            last_start = max(start for start, _, _ in self._very_narrow_segments)
+            if current_x >= first_end - post_margin and current_x <= last_start + pre_margin:
+                # 在两个极窄区间之间，保持极窄模式
+                return True, self._very_narrow_min_width
+        
+        # 方法3：原有的前方检测逻辑（作为后备）
         upper_obs = None
         lower_obs = None
         
@@ -1224,14 +1246,11 @@ class FormationRLEnv(gym.Env):
                 else:
                     lower_obs = obs
         
-        # 如果检测到上下两侧都有障碍物
         if upper_obs is not None and lower_obs is not None:
-            # 计算通道宽度
-            upper_bottom = upper_obs.y - upper_obs.height / 2  # 上侧障碍物的下边界
-            lower_top = lower_obs.y + lower_obs.height / 2     # 下侧障碍物的上边界
+            upper_bottom = upper_obs.y - upper_obs.height / 2
+            lower_top = lower_obs.y + lower_obs.height / 2
             passage_width = upper_bottom - lower_top
             
-            # 检测到极窄通道（宽度 < 1.5m，不够2车并行）
             if passage_width < 1.5:
                 return True, passage_width
         
