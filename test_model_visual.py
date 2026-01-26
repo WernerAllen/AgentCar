@@ -61,8 +61,9 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     print(f"Total Reward: {total_reward:.1f}")
     print(f"Status: {'Collision' if terminated else 'Success/Truncated'}")
     
-    # 绘制轨迹图（单图，更长比例）
-    fig, ax = plt.subplots(1, 1, figsize=(24, 6))
+    # 绘制轨迹图（上方轨迹 + 下方编队位置图）
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(24, 10), height_ratios=[1, 0.5],
+                                   gridspec_kw={'hspace': 0.25})
     
     # 小车实际尺寸
     car_length = 0.45
@@ -180,6 +181,79 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     ax.set_title(f'Trajectory - {scenario} (Total Reward: {total_reward:.1f})', fontsize=16)
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=12)
     ax.grid(True, alpha=0.3)
+    
+    # ===== 下方子图：编队快照图 =====
+    # 显示关键阶段的编队位置（减少到5个，更清晰）
+    snapshot_ratios = [0.0, 0.25, 0.5, 0.75, 1.0]
+    snapshot_labels = ['Start', '25%', '50%', '75%', 'End']
+    
+    # 每个快照之间的间距
+    spacing = 6
+    
+    for snap_idx, (ratio, label) in enumerate(zip(snapshot_ratios, snapshot_labels)):
+        offset_x = snap_idx * spacing + 2
+        
+        # 收集该阶段所有车的位置
+        snap_positions = []
+        for i, traj in enumerate(trajectories):
+            if traj:
+                idx = int(len(traj) * ratio) if ratio < 1.0 else len(traj) - 1
+                if 0 <= idx < len(traj):
+                    snap_positions.append((i, traj[idx][0], traj[idx][1]))
+        
+        if snap_positions:
+            center_x = np.mean([p[1] for p in snap_positions])
+            center_y = np.mean([p[2] for p in snap_positions])
+            
+            # 计算原始编队范围
+            orig_xs = [(p[1] - center_x) for p in snap_positions]
+            orig_ys = [(p[2] - center_y) for p in snap_positions]
+            
+            # 计算缩放比例，确保编队适应区域（最大宽度spacing-1，最大高度road_hw*1.5）
+            max_width = spacing - 2
+            max_height = road_hw * 1.5
+            x_range = max(orig_xs) - min(orig_xs) + car_length if orig_xs else 1
+            y_range = max(orig_ys) - min(orig_ys) + car_width if orig_ys else 1
+            scale = min(max_width / max(x_range, 0.1), max_height / max(y_range, 0.1), 1.5)
+            
+            all_rel_x = []
+            all_y = []
+            
+            for i, orig_x, orig_y in snap_positions:
+                rel_x = (orig_x - center_x) * scale
+                rel_y = center_y + (orig_y - center_y) * min(scale, 1.0)  # Y方向保持或缩小
+                all_rel_x.append(offset_x + rel_x)
+                all_y.append(rel_y)
+                car_rect = Rectangle(
+                    (offset_x + rel_x - car_length/2, rel_y - car_width/2),
+                    car_length, car_width,
+                    facecolor=colors[i], alpha=0.8, edgecolor='black', linewidth=1.5, zorder=5
+                )
+                ax2.add_patch(car_rect)
+            
+            # 用线条连接所有车形成外围轮廓
+            from scipy.spatial import ConvexHull
+            points = np.array(list(zip(all_rel_x, all_y)))
+            if len(points) >= 3:
+                hull = ConvexHull(points)
+                hull_points = points[hull.vertices]
+                hull_points = np.vstack([hull_points, hull_points[0]])  # 闭合
+                ax2.plot(hull_points[:, 0], hull_points[:, 1], 
+                        color='purple', linewidth=2, linestyle='-', alpha=0.7, zorder=3)
+        
+        # 添加阶段标签
+        ax2.text(offset_x, road_hw + 0.5, label, ha='center', fontsize=11, fontweight='bold')
+        # 添加分隔线
+        if snap_idx < len(snapshot_ratios) - 1:
+            ax2.axvline(x=offset_x + spacing/2 + 1, color='lightgray', linestyle='-', linewidth=1, alpha=0.5)
+    
+    # 设置坐标轴
+    ax2.set_xlim(-1, len(snapshot_ratios) * spacing + 2)
+    ax2.set_ylim(-road_hw - 1, road_hw + 1)
+    ax2.set_ylabel('Y (m)', fontsize=14)
+    ax2.set_title('Formation Snapshots at Different Stages', fontsize=14)
+    ax2.set_xticks([])
+    ax2.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
     

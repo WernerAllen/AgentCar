@@ -154,6 +154,7 @@ class FormationRLEnv(gym.Env):
         self._last_very_narrow_width = float('inf')
         self._very_narrow_recover_alpha = 1.0
         self._build_very_narrow_segments()
+        self._row_groups = self._build_row_groups()
         
         # 轨迹记录
         self.trajectories = [[] for _ in range(num_cars)]
@@ -193,6 +194,7 @@ class FormationRLEnv(gym.Env):
         self._last_is_very_narrow = False
         self._last_very_narrow_width = float('inf')
         self._very_narrow_recover_alpha = 1.0
+        self._row_groups = self._build_row_groups()
         
         # 重置累积修正量（4维dy）
         self.delta_accumulator = np.zeros(4, dtype=np.float32)
@@ -258,23 +260,8 @@ class FormationRLEnv(gym.Env):
         raw_target_positions = target_positions.copy()
         
         # 关键安全约束：防止RL输出导致目标位置太近
-        # 确保任意两车的目标y间距 >= 碰撞阈值
-        min_safe_dist = 2 * self.vehicle_params.car_radius + 0.1  # 0.64m
-        for i in range(self.num_cars):
-            for j in range(i+1, self.num_cars):
-                # 同一行的车（前左/前右 或 后左/后右）需要保持横向间距
-                if abs(self.formation_params.template_offsets[i][0] - 
-                       self.formation_params.template_offsets[j][0]) < 0.5:  # 同一行
-                    y_dist = target_positions[i, 1] - target_positions[j, 1]
-                    if abs(y_dist) < min_safe_dist:
-                        # 调整两车目标，使间距恢复到安全距离
-                        center_y = (target_positions[i, 1] + target_positions[j, 1]) / 2
-                        if y_dist >= 0:
-                            target_positions[i, 1] = center_y + min_safe_dist / 2
-                            target_positions[j, 1] = center_y - min_safe_dist / 2
-                        else:
-                            target_positions[i, 1] = center_y - min_safe_dist / 2
-                            target_positions[j, 1] = center_y + min_safe_dist / 2
+        # 确保同排两车目标y间距 >= 碰撞阈值
+        self._enforce_row_spacing(target_positions)
 
         # 记录目标点被安全约束修正的幅度（诊断用）
         target_adjustments = np.abs(target_positions[:, 1] - raw_target_positions[:, 1])
@@ -331,15 +318,33 @@ class FormationRLEnv(gym.Env):
             base_min_speed = 0.3
         else:
             base_min_speed = 0.8
+
+        # ===== 收缩阶段的队形约束（仅窄道模式） =====
+        # 注意：安全区域不强制收敛，让RL自由决策避障方向
+        if is_narrow_passage and not is_very_narrow:
+            # 窄道模式：轻微压缩RL输出，保持队形完整性
+            # 但不要过度压缩，否则会干扰RL的避障决策
+            narrow_alpha = 0.6  # 从0.35提高到0.6，给RL更多自由度
+            target_positions[:, 1] = ideal_positions[:, 1] + \
+                                     narrow_alpha * (target_positions[:, 1] - ideal_positions[:, 1])
+        # 安全区域（非窄道、非极窄）：不强制收敛，让RL自由决策
+        # 原有代码会压缩RL输出到50%~75%，导致中心障碍物场景（s4/s5）车车碰撞
+
+        self._enforce_row_spacing(target_positions)
         
         dwa_fallback_count = 0  # 初始化DWA回退计数
         for i, car in enumerate(self.cars):
             # 计算到前方最近队友的距离（窄道时用于减速避免追尾）
             front_teammate_dist = float('inf')
             if is_narrow_passage or is_very_narrow:
+                # 使用虚拟x打破同排同x的并列，避免纵队阶段前后车重叠
+                virtual_x = car.x + i * 0.01
                 for j, other in enumerate(self.cars):
-                    if j != i and other.x > car.x:  # 前方队友
-                        dist = other.x - car.x
+                    if j == i:
+                        continue
+                    other_virtual_x = other.x + j * 0.01
+                    if other_virtual_x > virtual_x:  # 前方队友
+                        dist = other_virtual_x - virtual_x
                         front_teammate_dist = min(front_teammate_dist, dist)
 
             # 收缩/极窄模式下：根据前车距离动态降低最小速度，避免追尾
@@ -1059,12 +1064,12 @@ class FormationRLEnv(gym.Env):
             # alpha: 0(安全) ~ 1(危险)
             
             # 动态权重：危险时允许变形，但保持位置跟随
-            w_shape = 0.25 * (1.0 - alpha) + 0.15 * alpha  # 安全时更强调形状
-            w_scale = 0.15 * (1.0 - alpha) + 0.05 * alpha
+            w_shape = 0.35 * (1.0 - alpha) + 0.2 * alpha  # 安全时更强调形状
+            w_scale = 0.2 * (1.0 - alpha) + 0.08 * alpha
             # 关键修复：危险时也要保持position惩罚，让RL跟随动态ideal收缩
             # 原来：w_pos = 0.5*(1-alpha) + 0*alpha，导致alpha=1时w_pos=0
             # 现在：危险时仍保持0.3的权重，确保收缩信号
-            w_pos = 0.9 * (1.0 - alpha) + 0.35 * alpha
+            w_pos = 1.2 * (1.0 - alpha) + 0.45 * alpha
             
             formation_penalty = w_shape * shape_error + w_scale * scale_error + w_pos * position_error
             recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
@@ -1082,7 +1087,7 @@ class FormationRLEnv(gym.Env):
             # ========== 5. 队形恢复奖励 ==========
             # 当安全(alpha<0.2)且队形接近理想时，给予额外奖励
             if alpha < 0.2 and np.sqrt(position_error) < 0.3:
-                recovery_bonus = 2.0
+                recovery_bonus = 3.0
                 reward += recovery_bonus
                 info['recovery_bonus'] = recovery_bonus
             else:
@@ -1147,6 +1152,32 @@ class FormationRLEnv(gym.Env):
         else:
             self._very_narrow_exit_x = None
             self._very_narrow_min_width = float('inf')
+
+    def _build_row_groups(self) -> List[List[int]]:
+        """根据编队模板构建同排分组"""
+        rows: Dict[float, List[int]] = {}
+        for i, offset in enumerate(self.formation_params.template_offsets):
+            row_key = round(offset[0], 1)
+            rows.setdefault(row_key, []).append(i)
+        return list(rows.values())
+
+    def _enforce_row_spacing(self, target_positions: np.ndarray) -> None:
+        """确保同排车辆横向间距不小于安全距离"""
+        min_safe_dist = 2 * self.vehicle_params.car_radius + 0.1  # 0.64m
+        for row in self._row_groups:
+            if len(row) < 2:
+                continue
+            # 只处理2车同排的情况
+            i, j = row[0], row[1]
+            y_dist = target_positions[i, 1] - target_positions[j, 1]
+            if abs(y_dist) < min_safe_dist:
+                center_y = (target_positions[i, 1] + target_positions[j, 1]) / 2
+                if y_dist >= 0:
+                    target_positions[i, 1] = center_y + min_safe_dist / 2
+                    target_positions[j, 1] = center_y - min_safe_dist / 2
+                else:
+                    target_positions[i, 1] = center_y - min_safe_dist / 2
+                    target_positions[j, 1] = center_y + min_safe_dist / 2
     
     def _detect_very_narrow_passage(self, current_x: float, lookahead: float = 10.0) -> Tuple[bool, float]:
         """
