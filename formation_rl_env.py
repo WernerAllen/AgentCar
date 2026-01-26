@@ -322,11 +322,27 @@ class FormationRLEnv(gym.Env):
         # ===== 收缩阶段的队形约束（仅窄道模式） =====
         # 注意：安全区域不强制收敛，让RL自由决策避障方向
         if is_narrow_passage and not is_very_narrow:
-            # 窄道模式：轻微压缩RL输出，保持队形完整性
-            # 但不要过度压缩，否则会干扰RL的避障决策
-            narrow_alpha = 0.6  # 从0.35提高到0.6，给RL更多自由度
-            target_positions[:, 1] = ideal_positions[:, 1] + \
-                                     narrow_alpha * (target_positions[:, 1] - ideal_positions[:, 1])
+            # 窄道模式：强制保持2x2矩形队形，只允许整体偏移
+            # 像Wide Gate那样保持队形形状，只进行压缩
+            
+            # 1. 计算RL期望的队形整体偏移（取所有车偏移的平均值）
+            rl_center_offset = np.mean(target_positions[:, 1]) - np.mean(ideal_positions[:, 1])
+            # 压缩整体偏移量，窄道时不需要大幅偏移
+            center_offset = rl_center_offset * 0.3
+            
+            # 2. 强制队形跟随理想位置（已包含压缩） + 整体偏移
+            target_positions[:, 1] = ideal_positions[:, 1] + center_offset
+            
+            # 3. 确保同排间距严格保持矩形形状
+            for row in self._row_groups:
+                if len(row) < 2:
+                    continue
+                i, j = row[0], row[1]
+                # 保持与理想队形完全一致的相对位置
+                ideal_spacing = ideal_positions[i, 1] - ideal_positions[j, 1]
+                current_center = (target_positions[i, 1] + target_positions[j, 1]) / 2
+                target_positions[i, 1] = current_center + ideal_spacing / 2
+                target_positions[j, 1] = current_center - ideal_spacing / 2
         # 安全区域（非窄道、非极窄）：不强制收敛，让RL自由决策
         # 原有代码会压缩RL输出到50%~75%，导致中心障碍物场景（s4/s5）车车碰撞
 
