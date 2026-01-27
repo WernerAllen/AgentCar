@@ -322,25 +322,22 @@ class FormationRLEnv(gym.Env):
         # ===== 收缩阶段的队形约束（仅窄道模式） =====
         # 注意：安全区域不强制收敛，让RL自由决策避障方向
         if is_narrow_passage and not is_very_narrow:
-            # 窄道模式：强制保持标准矩形队形，只进行横向压缩
-            # 核心思想：使用模板的相对位置，只缩放横向间距
+            # 窄道模式：强制保持完美对称的2x2矩形队形
+            # 核心思想：以通道中心为基准，完全对称压缩
             
-            # 1. 计算通道中心
+            # 1. 计算通道中心（障碍物场景通常中心在y=0）
             passage_center = (upper_bound_global + lower_bound_global) / 2
             
-            # 2. 计算RL期望的整体偏移（仅用于微调通道中心）
-            ideal_center = np.mean(ideal_positions[:, 1])
-            rl_center_offset = np.mean(target_positions[:, 1]) - ideal_center
-            center_offset = np.clip(rl_center_offset * 0.15, -0.2, 0.2)  # 更小的微调范围
+            # 2. 队形中心 = 通道中心（不允许RL微调，确保完美对称）
+            formation_center = passage_center
             
-            # 3. 队形中心 = 通道中心 + 微调
-            formation_center = passage_center + center_offset
-            
-            # 4. 从模板直接计算标准矩形位置
-            # 获取当前的压缩比例（从理想位置推算）
+            # 3. 计算压缩比例，确保队形能通过通道
             scale_factor = self._last_scale_factor
+            # 确保scale_factor不会太小，保持基本队形
+            scale_factor = max(scale_factor, 0.45)
             
-            # 5. 直接应用模板偏移 * 压缩比例 + 队形中心
+            # 4. 直接应用模板偏移 * 压缩比例 + 队形中心
+            # 确保完美对称：同符号的y偏移相等
             for i in range(self.num_cars):
                 template_y = self.formation_params.template_offsets[i][1]
                 target_positions[i, 1] = formation_center + template_y * scale_factor
@@ -425,6 +422,14 @@ class FormationRLEnv(gym.Env):
                     min_speed = min(min_speed, 0.3)
                 # 超过1.5m不降低最小速度，保持队形紧凑
             self.dwa_controllers[i].params.min_speed = min_speed
+            
+            # 窄道模式下增强DWA的横向跟随能力
+            if is_narrow_passage and not is_very_narrow:
+                self.dwa_controllers[i].params.rl_direction_weight = 8.0  # 增强横向跟随
+            elif is_very_narrow:
+                self.dwa_controllers[i].params.rl_direction_weight = 10.0  # 极窄时更强
+            else:
+                self.dwa_controllers[i].params.rl_direction_weight = 5.0  # 默认值
 
             # 计算本车的前视距离
             if is_very_narrow:
@@ -522,9 +527,10 @@ class FormationRLEnv(gym.Env):
             # DWA控制：目标点在前方，preferred_y引导横向移动
             state = (car.x, car.y, car.theta, car.v)
             goal = (dwa_target_x, dwa_target_y)
-            # 极窄通道模式下，preferred_y也用dwa_target_y，避免目标冲突
+            # 窄道/极窄/恢复期模式下，preferred_y强制使用目标位置
             recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
-            if is_very_narrow or recover_alpha < 1.0:
+            if is_very_narrow or recover_alpha < 1.0 or is_narrow_passage:
+                # 强制使用目标y，确保车辆快速到达目标位置
                 preferred_y = dwa_target_y
             else:
                 preferred_y = target_positions[i, 1]
