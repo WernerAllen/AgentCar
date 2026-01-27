@@ -322,40 +322,48 @@ class FormationRLEnv(gym.Env):
         # ===== 收缩阶段的队形约束（仅窄道模式） =====
         # 注意：安全区域不强制收敛，让RL自由决策避障方向
         if is_narrow_passage and not is_very_narrow:
-            # 窄道模式：强制保持2x2矩形队形，只允许整体偏移
-            # 像Wide Gate那样保持队形形状，只进行压缩
+            # 窄道模式：强制保持标准矩形队形，只进行横向压缩
+            # 核心思想：使用模板的相对位置，只缩放横向间距
             
-            # 1. 计算通道中心和理想队形中心
+            # 1. 计算通道中心
             passage_center = (upper_bound_global + lower_bound_global) / 2
+            
+            # 2. 计算RL期望的整体偏移（仅用于微调通道中心）
             ideal_center = np.mean(ideal_positions[:, 1])
-            
-            # 2. 计算RL期望的整体偏移（用于微调）
             rl_center_offset = np.mean(target_positions[:, 1]) - ideal_center
-            # 允许一定的整体偏移，但要限制幅度
-            center_offset = np.clip(rl_center_offset * 0.2, -0.3, 0.3)
+            center_offset = np.clip(rl_center_offset * 0.15, -0.2, 0.2)  # 更小的微调范围
             
-            # 3. 队形中心 = 通道中心 + RL微调
+            # 3. 队形中心 = 通道中心 + 微调
             formation_center = passage_center + center_offset
             
-            # 4. 强制所有车跟随理想队形的相对位置，但中心移到formation_center
-            for i in range(self.num_cars):
-                # 计算该车相对于理想队形中心的偏移
-                relative_offset = ideal_positions[i, 1] - ideal_center
-                # 应用到新的队形中心
-                target_positions[i, 1] = formation_center + relative_offset
+            # 4. 从模板直接计算标准矩形位置
+            # 获取当前的压缩比例（从理想位置推算）
+            scale_factor = self._last_scale_factor
             
-            # 5. 确保同排间距严格保持矩形形状（双重保证）
-            for row in self._row_groups:
-                if len(row) < 2:
-                    continue
-                i, j = row[0], row[1]
-                # 保持与理想队形完全一致的相对位置
-                ideal_spacing = ideal_positions[i, 1] - ideal_positions[j, 1]
-                current_center = (target_positions[i, 1] + target_positions[j, 1]) / 2
-                target_positions[i, 1] = current_center + ideal_spacing / 2
-                target_positions[j, 1] = current_center - ideal_spacing / 2
-        # 安全区域（非窄道、非极窄）：不强制收敛，让RL自由决策
-        # 原有代码会压缩RL输出到50%~75%，导致中心障碍物场景（s4/s5）车车碰撞
+            # 5. 直接应用模板偏移 * 压缩比例 + 队形中心
+            for i in range(self.num_cars):
+                template_y = self.formation_params.template_offsets[i][1]
+                target_positions[i, 1] = formation_center + template_y * scale_factor
+        
+        # 安全区域的队形恢复（非窄道、非极窄时）
+        elif not is_very_narrow:
+            # 检查是否经历过极窄通道（需要恢复或保持队形）
+            recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
+            if self._very_narrow_seen:
+                if recover_alpha < 1.0:
+                    # 恢复期：逐步从纵队恢复到标准2x2矩形
+                    # recover_alpha: 0(刚退出,保持收拢) -> 1(完全恢复到标准矩形)
+                    for i in range(self.num_cars):
+                        template_y = self.formation_params.template_offsets[i][1]
+                        target_positions[i, 1] = template_y * recover_alpha
+                else:
+                    # 恢复完成后：使用标准位置 + 小幅RL微调
+                    # 确保队形恢复到标准矩形，同时允许RL微调
+                    for i in range(self.num_cars):
+                        template_y = self.formation_params.template_offsets[i][1]
+                        rl_offset = self.delta_accumulator[i] * 0.3  # 允许小幅微调
+                        target_positions[i, 1] = template_y + np.clip(rl_offset, -0.2, 0.2)
+        # 其他安全区域（未经历极窄通道）：让RL自由决策（用于s4/s5等中心障碍物场景）
 
         self._enforce_row_spacing(target_positions)
         
@@ -425,12 +433,14 @@ class FormationRLEnv(gym.Env):
                         # 前方队友距离尚可，轻微减速
                         lookahead = min(lookahead, 3.5)
                 recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
-                if recover_alpha < 1.0:
-                    # 极窄退出后的缓慢过渡：逐步恢复到2x2队形
-                    recover_limit = 0.25 + 0.55 * recover_alpha  # 0.25 -> 0.80
-                    blended_y = target_positions[i, 1] * recover_alpha
-                    dwa_target_y = np.clip(blended_y, -recover_limit, recover_limit)
+                if self._very_narrow_seen and recover_alpha < 1.0:
+                    # 极窄退出后的恢复期：逐步恢复到2x2队形
+                    # target_positions已经包含了恢复逻辑，直接使用
+                    # 限制范围确保平滑过渡
+                    recover_limit = 0.3 + 0.5 * recover_alpha  # 0.3 -> 0.8
+                    dwa_target_y = np.clip(target_positions[i, 1], -recover_limit, recover_limit)
                 else:
+                    # 正常模式或恢复完成后：直接使用target_positions
                     dwa_target_y = target_positions[i, 1]
                 
                 # 注意：移除_safe_target_y的强制修正
