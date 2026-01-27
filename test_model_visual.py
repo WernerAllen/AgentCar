@@ -183,12 +183,12 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     ax.grid(True, alpha=0.3)
     
     # ===== 下方子图：编队快照图 =====
-    # 显示关键阶段的编队位置（减少到5个，更清晰）
-    snapshot_ratios = [0.0, 0.25, 0.5, 0.75, 1.0]
-    snapshot_labels = ['Start', '25%', '50%', '75%', 'End']
+    # 显示每10%阶段的编队位置
+    snapshot_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    snapshot_labels = ['0%', '10%', '20%', '30%', '40%', '50%', '60%', '70%', '80%', '90%', '100%']
     
     # 每个快照之间的间距
-    spacing = 6
+    spacing = 4
     
     for snap_idx, (ratio, label) in enumerate(zip(snapshot_ratios, snapshot_labels)):
         offset_x = snap_idx * spacing + 2

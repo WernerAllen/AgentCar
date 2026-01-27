@@ -311,9 +311,9 @@ class FormationRLEnv(gym.Env):
         is_narrow_passage = passage_width_global < formation_width + 0.5  # 通道<2.1m时触发
         
         if is_narrow_passage and not is_very_narrow:
-            # 窄道模式：增大前视距离，让DWA有更多时间横移
-            base_lookahead = 5.0
-            base_min_speed = 0.4
+            # 窄道模式：适中的前视距离，保持队形紧凑
+            base_lookahead = 3.5  # 从5.0减小到3.5，保持更紧凑的纵向间距
+            base_min_speed = 0.5  # 稍微提高最低速度，减少速度差异
         elif is_very_narrow:
             base_min_speed = 0.3
         else:
@@ -367,6 +367,33 @@ class FormationRLEnv(gym.Env):
 
         self._enforce_row_spacing(target_positions)
         
+        # ===== 窄道模式：预计算同排车辆的协调lookahead =====
+        # 确保同排两车保持相同的x位置（紧凑矩形队形）
+        row_lookahead = {}  # key: row_key, value: lookahead
+        if is_narrow_passage and not is_very_narrow:
+            for row in self._row_groups:
+                if len(row) < 2:
+                    continue
+                row_key = self.formation_params.template_offsets[row[0]][0]  # 使用x偏移作为key
+                # 计算该排车辆的最小前方距离
+                min_front_dist = float('inf')
+                for car_idx in row:
+                    car = self.cars[car_idx]
+                    for j, other in enumerate(self.cars):
+                        if j not in row:  # 只看其他排的车
+                            if other.x > car.x:
+                                dist = other.x - car.x
+                                min_front_dist = min(min_front_dist, dist)
+                # 根据最小前方距离计算该排的统一lookahead
+                if min_front_dist < 1.0:
+                    row_lookahead[row_key] = 0.8
+                elif min_front_dist < 1.8:
+                    row_lookahead[row_key] = 1.5
+                elif min_front_dist < 2.5:
+                    row_lookahead[row_key] = 2.5
+                else:
+                    row_lookahead[row_key] = base_lookahead
+        
         dwa_fallback_count = 0  # 初始化DWA回退计数
         for i, car in enumerate(self.cars):
             # 计算到前方最近队友的距离（窄道时用于减速避免追尾）
@@ -384,11 +411,19 @@ class FormationRLEnv(gym.Env):
 
             # 收缩/极窄模式下：根据前车距离动态降低最小速度，避免追尾
             min_speed = base_min_speed
-            if is_narrow_passage or is_very_narrow:
+            if is_very_narrow:
+                # 极窄模式：更激进的减速以形成纵队
                 if front_teammate_dist < self.front_buffer_dist:
                     min_speed = 0.0
                 elif front_teammate_dist < self.follow_brake_dist:
                     min_speed = min(min_speed, 0.2)
+            elif is_narrow_passage:
+                # 窄道模式：温和减速，保持队形紧凑
+                if front_teammate_dist < 1.0:
+                    min_speed = 0.0
+                elif front_teammate_dist < 1.5:
+                    min_speed = min(min_speed, 0.3)
+                # 超过1.5m不降低最小速度，保持队形紧凑
             self.dwa_controllers[i].params.min_speed = min_speed
 
             # 计算本车的前视距离
@@ -417,21 +452,12 @@ class FormationRLEnv(gym.Env):
             else:
                 # 正常模式
                 lookahead = base_lookahead
-                if is_narrow_passage and front_teammate_dist < float('inf'):
-                    # 窄道但非极窄时：增强减速，防止追尾碰撞
-                    # 分析显示car_car碰撞多发于x=14-15m，需要更激进的减速
-                    if front_teammate_dist < 1.5:
-                        # 前方队友很近(<1.5m)，大幅减速等待
-                        lookahead = min(lookahead, 0.5)
-                    elif front_teammate_dist < 2.5:
-                        # 前方队友较近，显著减速
-                        lookahead = min(lookahead, 1.5)
-                    elif front_teammate_dist < 4.0:
-                        # 前方队友中等距离，适度减速
-                        lookahead = min(lookahead, 2.5)
-                    elif front_teammate_dist < 6.0:
-                        # 前方队友距离尚可，轻微减速
-                        lookahead = min(lookahead, 3.5)
+                if is_narrow_passage and not is_very_narrow:
+                    # 窄道模式：使用同排协调的lookahead，保持矩形队形
+                    row_key = self.formation_params.template_offsets[i][0]
+                    if row_key in row_lookahead:
+                        lookahead = row_lookahead[row_key]
+                    # 如果没有预计算值，使用默认的base_lookahead
                 recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
                 if self._very_narrow_seen and recover_alpha < 1.0:
                     # 极窄退出后的恢复期：逐步恢复到2x2队形
