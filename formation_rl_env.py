@@ -156,6 +156,11 @@ class FormationRLEnv(gym.Env):
         self._build_very_narrow_segments()
         self._row_groups = self._build_row_groups()
         
+        # 安全区域队形恢复（用于通过障碍物后恢复标准队形）
+        self._last_obstacle_exit_x = None  # 最近通过的障碍物出口x坐标
+        self._safe_zone_recover_alpha = 1.0  # 安全区域恢复系数（0=刚出障碍物, 1=完全恢复）
+        self._safe_zone_recover_dist = 15.0  # 恢复所需距离（米）
+        
         # 轨迹记录
         self.trajectories = [[] for _ in range(num_cars)]
         
@@ -195,6 +200,10 @@ class FormationRLEnv(gym.Env):
         self._last_very_narrow_width = float('inf')
         self._very_narrow_recover_alpha = 1.0
         self._row_groups = self._build_row_groups()
+        
+        # 重置安全区域恢复状态
+        self._last_obstacle_exit_x = None
+        self._safe_zone_recover_alpha = 1.0
         
         # 重置累积修正量（4维dy）
         self.delta_accumulator = np.zeros(4, dtype=np.float32)
@@ -361,10 +370,33 @@ class FormationRLEnv(gym.Env):
             # 检查是否经历过极窄通道（需要恢复或保持队形）
             recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
             
+            # 检测前方是否有障碍物（用于安全区域判断）
+            obstacle_ahead_dist = self._get_obstacle_ahead_distance(avg_x)
+            is_in_safe_zone = obstacle_ahead_dist > 12.0  # 前方12m内无障碍物
+            
+            # 更新最近通过的障碍物出口位置
+            if not is_in_safe_zone:
+                # 正在通过障碍物区域，记录当前位置
+                self._last_obstacle_exit_x = avg_x
+                self._safe_zone_recover_alpha = 0.0
+            elif self._last_obstacle_exit_x is not None:
+                # 计算安全区域恢复系数
+                dist_from_exit = avg_x - self._last_obstacle_exit_x
+                self._safe_zone_recover_alpha = np.clip(
+                    dist_from_exit / self._safe_zone_recover_dist, 0.0, 1.0
+                )
+            
             if is_splitting_local or is_merging_local:
                 # 中心障碍物场景（分流或聚合）：让RL自由决策
-                # 不修改target_positions，完全依赖RL的输出
-                pass
+                # 但在聚合后期（is_merging且离障碍物较远时），逐步恢复队形
+                if is_merging_local and self._safe_zone_recover_alpha > 0.3:
+                    # 聚合后期：开始恢复标准队形
+                    merge_recover_alpha = (self._safe_zone_recover_alpha - 0.3) / 0.7
+                    for i in range(self.num_cars):
+                        template_y = self.formation_params.template_offsets[i][1]
+                        current_target_y = target_positions[i, 1]
+                        target_positions[i, 1] = current_target_y * (1 - merge_recover_alpha) + template_y * merge_recover_alpha
+                # 否则不修改target_positions，完全依赖RL的输出
             elif self._very_narrow_seen:
                 if recover_alpha < 1.0:
                     # 恢复期：逐步从纵队恢复到标准2x2矩形
@@ -376,6 +408,15 @@ class FormationRLEnv(gym.Env):
                     for i in range(self.num_cars):
                         template_y = self.formation_params.template_offsets[i][1]
                         target_positions[i, 1] = template_y
+            elif is_in_safe_zone and self._safe_zone_recover_alpha > 0.0:
+                # ===== 新增：安全区域队形恢复机制 =====
+                # 通过普通障碍物后（非极窄、非中心），逐步恢复到标准2x2队形
+                # 这确保队形像baseline宽门一样整齐
+                for i in range(self.num_cars):
+                    template_y = self.formation_params.template_offsets[i][1]
+                    current_target_y = target_positions[i, 1]
+                    # 使用恢复系数混合当前目标和标准位置
+                    target_positions[i, 1] = current_target_y * (1 - self._safe_zone_recover_alpha) + template_y * self._safe_zone_recover_alpha
         # 其他安全区域（未经历极窄通道）：让RL自由决策
 
         self._enforce_row_spacing(target_positions)
@@ -1222,6 +1263,41 @@ class FormationRLEnv(gym.Env):
             if 0 < rel_x < distance:
                 return True
         return False
+    
+    def _get_obstacle_ahead_distance(self, current_x: float) -> float:
+        """
+        获取到前方最近障碍物的距离
+        
+        Returns:
+            距离（米），如果前方无障碍物则返回 float('inf')
+        """
+        min_dist = float('inf')
+        for obs in self.obstacles:
+            # 计算障碍物的起始x位置（考虑宽度）
+            if obs.width > 0:
+                obs_start_x = obs.x - obs.width / 2
+            else:
+                obs_start_x = obs.x - obs.radius
+            
+            # 计算障碍物的结束x位置
+            if obs.width > 0:
+                obs_end_x = obs.x + obs.width / 2
+            else:
+                obs_end_x = obs.x + obs.radius
+            
+            # 如果车队已经超过障碍物，跳过
+            if current_x > obs_end_x + 2.0:
+                continue
+            
+            # 计算到障碍物起始位置的距离
+            dist_to_obs = obs_start_x - current_x
+            if dist_to_obs > 0:
+                min_dist = min(min_dist, dist_to_obs)
+            elif current_x < obs_end_x:
+                # 当前在障碍物区域内
+                min_dist = 0.0
+        
+        return min_dist
 
     def _check_center_obstacle(self, current_x: float, distance: float = 15.0) -> Tuple[bool, bool]:
         """
