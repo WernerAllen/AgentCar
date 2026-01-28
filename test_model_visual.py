@@ -73,6 +73,29 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     colors = ['red', 'blue', 'green', 'orange']
     linestyles = ['-', '--', '-.', ':']
     
+    # 计算“经过障碍物附近”的快照索引：对每个障碍物x，取车辆平均x首次>=该值的时刻
+    snapshots = []
+    if all(len(traj) > 0 for traj in trajectories):
+        num_steps = min(len(traj) for traj in trajectories)
+        xs_mat = np.array([[p[0] for p in traj[:num_steps]] for traj in trajectories])
+        mean_xs = xs_mat.mean(axis=0)
+        obstacle_xs = sorted({float(obs.x) for obs in env.obstacles})
+        for x in obstacle_xs:
+            if mean_xs.max() < x:
+                continue
+            idx = int(np.argmin(np.abs(mean_xs - x)))
+            if 0 < idx < num_steps - 1:
+                snapshots.append((x, idx))
+        # 去重（多个障碍物可能映射到同一步）
+        dedup = []
+        seen = set()
+        for x, idx in snapshots:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            dedup.append((x, idx))
+        snapshots = dedup
+    
     for i, traj in enumerate(trajectories):
         if traj:
             xs, ys = zip(*traj)
@@ -98,9 +121,7 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
             
             # ===== 中间快照机制 =====
             # 在轨迹的多个位置绘制小车矩形轮廓
-            snapshot_ratios = [0.25, 0.5, 0.75]
-            for ratio in snapshot_ratios:
-                idx = int(len(xs) * ratio)
+            for snap_x, idx in snapshots:
                 if 0 < idx < len(xs) - 1:
                     # 使用小车矩形轮廓（与起点/终点一致）
                     snap_rect = Rectangle(
@@ -125,23 +146,20 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     
     # ===== 中间快照编队框 + 垂直标识线 =====
     # 在快照位置绘制垂直虚线和编队框，使其在长轨迹上也清晰可见
-    snapshot_ratios = [0.25, 0.5, 0.75]
-    snapshot_colors = ['green', 'orange', 'red']  # 25%绿 50%橙 75%红
-    for ratio, snap_color in zip(snapshot_ratios, snapshot_colors):
+    snapshot_colors = plt.cm.plasma(np.linspace(0.2, 0.9, max(len(snapshots), 1)))
+    for (snap_x, idx), snap_color in zip(snapshots, snapshot_colors):
         snap_xs = []
         snap_ys = []
         for traj in trajectories:
             if traj:
-                idx = int(len(traj) * ratio)
                 if 0 < idx < len(traj):
                     snap_xs.append(traj[idx][0])
                     snap_ys.append(traj[idx][1])
         if snap_xs and snap_ys:
             # 垂直虚线标识快照位置
-            mean_x = np.mean(snap_xs)
-            ax.axvline(x=mean_x, color=snap_color, linestyle=':', 
+            ax.axvline(x=snap_x, color=snap_color, linestyle=':', 
                       linewidth=1.5, alpha=0.6, zorder=2,
-                      label=f'{int(ratio*100)}% snapshot' if ratio == 0.5 else None)
+                      label=None)
             # 编队框
             snap_formation_rect = Rectangle(
                 (min(snap_xs) - 0.3, min(snap_ys) - 0.3),
@@ -184,20 +202,20 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
     
     # ===== 下方子图：编队快照图 =====
     # 显示每10%阶段的编队位置
-    snapshot_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    snapshot_labels = ['0%', '10%', '20%', '30%', '40%', '50%', '60%', '70%', '80%', '90%', '100%']
+    snapshot_items = [('Start', 0)]
+    snapshot_items += [(f'x={x:.0f}', idx) for x, idx in snapshots]
+    snapshot_items += [('End', len(trajectories[0]) - 1 if trajectories and trajectories[0] else 0)]
     
     # 每个快照之间的间距
     spacing = 4
     
-    for snap_idx, (ratio, label) in enumerate(zip(snapshot_ratios, snapshot_labels)):
+    for snap_idx, (label, idx) in enumerate(snapshot_items):
         offset_x = snap_idx * spacing + 2
         
         # 收集该阶段所有车的位置
         snap_positions = []
         for i, traj in enumerate(trajectories):
             if traj:
-                idx = int(len(traj) * ratio) if ratio < 1.0 else len(traj) - 1
                 if 0 <= idx < len(traj):
                     snap_positions.append((i, traj[idx][0], traj[idx][1]))
         
@@ -244,11 +262,11 @@ def test_model_visual(model_path: str, scenario: str = "s1_right", max_steps: in
         # 添加阶段标签
         ax2.text(offset_x, road_hw + 0.5, label, ha='center', fontsize=11, fontweight='bold')
         # 添加分隔线
-        if snap_idx < len(snapshot_ratios) - 1:
+        if snap_idx < len(snapshot_items) - 1:
             ax2.axvline(x=offset_x + spacing/2 + 1, color='lightgray', linestyle='-', linewidth=1, alpha=0.5)
     
     # 设置坐标轴
-    ax2.set_xlim(-1, len(snapshot_ratios) * spacing + 2)
+    ax2.set_xlim(-1, len(snapshot_items) * spacing + 2)
     ax2.set_ylim(-road_hw - 1, road_hw + 1)
     ax2.set_ylabel('Y (m)', fontsize=14)
     ax2.set_title('Formation Snapshots at Different Stages', fontsize=14)

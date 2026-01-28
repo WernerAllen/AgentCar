@@ -333,8 +333,9 @@ class FormationRLEnv(gym.Env):
             
             # 3. 计算压缩比例，确保队形能通过通道
             scale_factor = self._last_scale_factor
-            # 确保scale_factor不会太小，保持基本队形
-            scale_factor = max(scale_factor, 0.45)
+            # 确保scale_factor不会太小，保持基本矩形队形
+            # 0.5 * 1.6m = 0.8m 横向间距，足够安全且保持队形
+            scale_factor = max(scale_factor, 0.5)
             
             # 4. 直接应用模板偏移 * 压缩比例 + 队形中心
             # 确保完美对称：同符号的y偏移相等
@@ -342,25 +343,30 @@ class FormationRLEnv(gym.Env):
                 template_y = self.formation_params.template_offsets[i][1]
                 target_positions[i, 1] = formation_center + template_y * scale_factor
         
-        # 安全区域的队形恢复（非窄道、非极窄时）
+        # 安全区域的队形控制（非窄道、非极窄时）
         elif not is_very_narrow:
+            # 检测是否有中心障碍物（s5类型，需要分流或聚合）
+            is_splitting_local, is_merging_local = self._check_center_obstacle(avg_x, distance=15.0)
+            
             # 检查是否经历过极窄通道（需要恢复或保持队形）
             recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
-            if self._very_narrow_seen:
+            
+            if is_splitting_local or is_merging_local:
+                # 中心障碍物场景（分流或聚合）：让RL自由决策
+                # 不修改target_positions，完全依赖RL的输出
+                pass
+            elif self._very_narrow_seen:
                 if recover_alpha < 1.0:
                     # 恢复期：逐步从纵队恢复到标准2x2矩形
-                    # recover_alpha: 0(刚退出,保持收拢) -> 1(完全恢复到标准矩形)
                     for i in range(self.num_cars):
                         template_y = self.formation_params.template_offsets[i][1]
                         target_positions[i, 1] = template_y * recover_alpha
                 else:
-                    # 恢复完成后：使用标准位置 + 小幅RL微调
-                    # 确保队形恢复到标准矩形，同时允许RL微调
+                    # 恢复完成后：强制使用标准位置，确保完美恢复
                     for i in range(self.num_cars):
                         template_y = self.formation_params.template_offsets[i][1]
-                        rl_offset = self.delta_accumulator[i] * 0.3  # 允许小幅微调
-                        target_positions[i, 1] = template_y + np.clip(rl_offset, -0.2, 0.2)
-        # 其他安全区域（未经历极窄通道）：让RL自由决策（用于s4/s5等中心障碍物场景）
+                        target_positions[i, 1] = template_y
+        # 其他安全区域（未经历极窄通道）：让RL自由决策
 
         self._enforce_row_spacing(target_positions)
         
@@ -392,6 +398,8 @@ class FormationRLEnv(gym.Env):
                     row_lookahead[row_key] = base_lookahead
         
         dwa_fallback_count = 0  # 初始化DWA回退计数
+        is_splitting, is_merging = self._check_center_obstacle(avg_x, distance=15.0)  # 中心障碍物检测
+        
         for i, car in enumerate(self.cars):
             # 计算到前方最近队友的距离（窄道时用于减速避免追尾）
             front_teammate_dist = float('inf')
@@ -421,6 +429,18 @@ class FormationRLEnv(gym.Env):
                 elif front_teammate_dist < 1.5:
                     min_speed = min(min_speed, 0.3)
                 # 超过1.5m不降低最小速度，保持队形紧凑
+            # 聚合期（通过中心障碍物后）：需要更谨慎的速度控制
+            if is_merging:
+                # 检查是否有其他车辆在横向较近的位置（可能路径交叉）
+                for j, other in enumerate(self.cars):
+                    if j != i:
+                        dy = abs(other.y - car.y)
+                        dx = abs(other.x - car.x)
+                        # 横向较近且纵向也较近：可能在聚合中交叉
+                        if dy < 1.2 and dx < 1.5:
+                            min_speed = min(min_speed, 0.5)  # 降低速度
+                            break
+            
             self.dwa_controllers[i].params.min_speed = min_speed
             
             # 窄道模式下增强DWA的横向跟随能力
@@ -429,7 +449,7 @@ class FormationRLEnv(gym.Env):
             elif is_very_narrow:
                 self.dwa_controllers[i].params.rl_direction_weight = 10.0  # 极窄时更强
             else:
-                self.dwa_controllers[i].params.rl_direction_weight = 5.0  # 默认值
+                self.dwa_controllers[i].params.rl_direction_weight = 5.0  # 默认值（分流/聚合/正常）
 
             # 计算本车的前视距离
             if is_very_narrow:
@@ -503,7 +523,6 @@ class FormationRLEnv(gym.Env):
                     
                     if dist < 5.0 and (not is_front_teammate or front_too_close):
                         # 收缩模式下的同排队友：已有目标间距硬约束(0.64m)，DWA不需要再避
-                        # 这是关键修复：解决DWA可行解不足的问题
                         if is_contracting and same_row:
                             continue  # 不将同排队友作为DWA障碍
                         
@@ -513,7 +532,12 @@ class FormationRLEnv(gym.Env):
                         if is_contracting:
                             teammate_radius = self.vehicle_params.car_radius + 0.05  # 0.32m，更宽松
                             predicted_y = target_positions[j, 1]
+                        elif is_merging:
+                            # 聚合期：增大避碰半径，防止聚合时碰撞
+                            teammate_radius = self.vehicle_params.car_radius + 0.2  # 0.47m，更安全
+                            predicted_y = other.y
                         else:
+                            # 分流期和正常情况：正常避碰半径
                             teammate_radius = base_radius
                             predicted_y = other.y
                         
@@ -1184,6 +1208,29 @@ class FormationRLEnv(gym.Env):
             if 0 < rel_x < distance:
                 return True
         return False
+
+    def _check_center_obstacle(self, current_x: float, distance: float = 15.0) -> Tuple[bool, bool]:
+        """
+        检测是否在中心障碍物影响范围内，区分分流期和聚合期
+        
+        Returns:
+            (is_splitting, is_merging): 分流期标志, 聚合期标志
+        """
+        for obs in self.obstacles:
+            if obs.width > 0 and obs.height > 0:
+                obs_top = obs.y + obs.height / 2
+                obs_bottom = obs.y - obs.height / 2
+                # 中心障碍物：跨越y=0区域
+                if obs_bottom < 0.5 and obs_top > -0.5:
+                    obs_end = obs.x + obs.width / 2
+                    obs_start = obs.x - obs.width / 2
+                    # 分流期：障碍物前方distance到障碍物结束
+                    if obs_start - distance < current_x <= obs_end + 2.0:
+                        return (True, False)
+                    # 聚合期：障碍物结束后2m到20m
+                    elif obs_end + 2.0 < current_x < obs_end + 20.0:
+                        return (False, True)
+        return (False, False)
 
     def _build_very_narrow_segments(self) -> None:
         """预计算极窄通道区间，用于跨门保持纵队"""
