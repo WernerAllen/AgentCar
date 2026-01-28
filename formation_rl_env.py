@@ -140,7 +140,7 @@ class FormationRLEnv(gym.Env):
         self.narrow_lookahead = 8.0
         self.very_narrow_lookahead = 10.0
         self.very_narrow_exit_margin = 6.0
-        self.very_narrow_recover_dist = 8.0
+        self.very_narrow_recover_dist = 12.0  # 增加恢复距离，确保队形完全恢复
         # 前车追尾缓冲距离（仅在收缩/极窄模式启用）
         self.front_buffer_dist = 1.6
         self.follow_brake_dist = 2.8
@@ -310,12 +310,20 @@ class FormationRLEnv(gym.Env):
         formation_width = 1.6  # 原始队形宽度
         is_narrow_passage = passage_width_global < formation_width + 0.5  # 通道<2.1m时触发
         
+        # 检查恢复期
+        recover_alpha_check = getattr(self, "_very_narrow_recover_alpha", 1.0)
+        is_recovering = self._very_narrow_seen and recover_alpha_check < 1.0
+        
         if is_narrow_passage and not is_very_narrow:
             # 窄道模式：适中的前视距离，保持队形紧凑
             base_lookahead = 3.5  # 从5.0减小到3.5，保持更紧凑的纵向间距
             base_min_speed = 0.5  # 稍微提高最低速度，减少速度差异
         elif is_very_narrow:
             base_min_speed = 0.3
+        elif is_recovering:
+            # 恢复期：适中速度，给队形恢复更多时间
+            base_lookahead = 4.0
+            base_min_speed = 0.5
         else:
             base_min_speed = 0.8
 
@@ -331,11 +339,13 @@ class FormationRLEnv(gym.Env):
             # 2. 队形中心 = 通道中心（不允许RL微调，确保完美对称）
             formation_center = passage_center
             
-            # 3. 计算压缩比例，确保队形能通过通道
-            scale_factor = self._last_scale_factor
-            # 确保scale_factor不会太小，保持基本矩形队形
-            # 0.5 * 1.6m = 0.8m 横向间距，足够安全且保持队形
-            scale_factor = max(scale_factor, 0.5)
+            # 3. 计算压缩比例，确保队形能通过通道且保持矩形
+            # 使用有效通道宽度计算scale_factor
+            effective_width = passage_width_global - 0.3  # 安全余量
+            formation_original_width = 1.6  # 原始队形横向跨度
+            computed_scale = effective_width / formation_original_width
+            # 限制在[0.5, 1.0]范围内，确保矩形队形
+            scale_factor = np.clip(computed_scale, 0.5, 1.0)
             
             # 4. 直接应用模板偏移 * 压缩比例 + 队形中心
             # 确保完美对称：同符号的y偏移相等
@@ -444,12 +454,16 @@ class FormationRLEnv(gym.Env):
             self.dwa_controllers[i].params.min_speed = min_speed
             
             # 窄道模式下增强DWA的横向跟随能力
+            recover_alpha = getattr(self, "_very_narrow_recover_alpha", 1.0)
             if is_narrow_passage and not is_very_narrow:
                 self.dwa_controllers[i].params.rl_direction_weight = 8.0  # 增强横向跟随
             elif is_very_narrow:
                 self.dwa_controllers[i].params.rl_direction_weight = 10.0  # 极窄时更强
+            elif recover_alpha < 1.0:
+                # 恢复期：增强横向跟随，确保快速恢复队形
+                self.dwa_controllers[i].params.rl_direction_weight = 8.0
             else:
-                self.dwa_controllers[i].params.rl_direction_weight = 5.0  # 默认值（分流/聚合/正常）
+                self.dwa_controllers[i].params.rl_direction_weight = 5.0  # 默认值
 
             # 计算本车的前视距离
             if is_very_narrow:
