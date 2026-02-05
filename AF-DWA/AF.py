@@ -11,12 +11,7 @@
 import os
 import sys
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
-
-# 设置字体为Arial
-matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
-matplotlib.rcParams['axes.unicode_minus'] = False
 from matplotlib.patches import Rectangle
 from typing import List, Tuple
 
@@ -283,12 +278,12 @@ def run_single_gate_test(
     print(f"\nResult: {'PASS' if success else 'FAIL'}")
 
     # 绘图（与baseline2风格一致）
-    fig, ax = plt.subplots(figsize=(8, 3.0))
+    fig, ax = plt.subplots(figsize=(8, 2.5))
     car_length = vehicle_params.car_length
     car_width = vehicle_params.car_width
     max_x = max(max(p[0] for p in t) for t in traj if t) + 3
 
-    # 道路边界（不再填充灰色背景）
+    ax.fill_between([0, max_x], [-road_half_width]*2, [road_half_width]*2, color='lightgray', alpha=0.3)
     ax.axhline(y=road_half_width, color='black', linestyle='--', linewidth=2)
     ax.axhline(y=-road_half_width, color='black', linestyle='--', linewidth=2)
 
@@ -306,27 +301,11 @@ def run_single_gate_test(
                 snapshot_idx = idx
                 break
     
-    # 平滑函数
-    def _smooth_mavg(arr: np.ndarray, window: int) -> np.ndarray:
-        if window <= 1 or arr.size < 3:
-            return arr
-        w = int(window)
-        if w % 2 == 0:
-            w += 1
-        pad = w // 2
-        padded = np.pad(arr, (pad, pad), mode='edge')
-        kernel = np.ones(w, dtype=float) / float(w)
-        smoothed = np.convolve(padded, kernel, mode='valid')
-        return smoothed
-
     for i, t in enumerate(traj):
         if t:
             xs, ys = zip(*t)
-            xs_np = np.asarray(xs, dtype=float)
-            ys_np = np.asarray(ys, dtype=float)
-            ys_np = _smooth_mavg(ys_np, window=30)  # 平滑轨迹
             # 轨迹用虚线
-            ax.plot(xs_np, ys_np, color=colors[i], linestyle='--', label=f'UGV {i}', linewidth=1.5, alpha=0.7)
+            ax.plot(xs, ys, color=colors[i], linestyle='--', label=f'Car {i}', linewidth=1.5, alpha=0.7)
             # 起点车辆（实心）
             ax.add_patch(Rectangle((xs[0]-car_length/2, ys[0]-car_width/2), car_length, car_width,
                                     facecolor=colors[i], alpha=0.9, edgecolor='black', zorder=5))
@@ -342,15 +321,13 @@ def run_single_gate_test(
     ax.set_xlim(0, max_x + 1)
     ax.set_ylim(-road_half_width - 0.5, road_half_width + 0.5)
     ax.set_aspect('equal')
-    ax.set_xlabel('X (m)', fontsize=10)
-    ax.set_ylabel('Y (m)', fontsize=10)
-    ax.set_title(f'{gate_name}', fontsize=11)
-    # 图例放在图下方，水平排列（位置下移避免遮挡X轴）
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.35), ncol=4, fontsize=9, frameon=True)
-    ax.grid(True, alpha=0.35)
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_title(f'{gate_name}', fontweight='bold', fontsize=14)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.3)  # 为底部图例留出更多空间
     plt.savefig(os.path.join(CURRENT_DIR, f'single_gate_{gate_type}.pdf'), format='pdf', bbox_inches='tight')
     plt.savefig(os.path.join(CURRENT_DIR, f'single_gate_{gate_type}.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)

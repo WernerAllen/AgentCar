@@ -155,6 +155,8 @@ class FormationRLEnv(gym.Env):
         self._very_narrow_recover_alpha = 1.0
         self._build_very_narrow_segments()
         self._row_groups = self._build_row_groups()
+        # 上下两排（y>0 与 y<0）分组，用于综合场景中的纵向同步
+        self._column_groups = self._build_column_groups()
         
         # 安全区域队形恢复（用于通过障碍物后恢复标准队形）
         self._last_obstacle_exit_x = None  # 最近通过的障碍物出口x坐标
@@ -200,6 +202,7 @@ class FormationRLEnv(gym.Env):
         self._last_very_narrow_width = float('inf')
         self._very_narrow_recover_alpha = 1.0
         self._row_groups = self._build_row_groups()
+        self._column_groups = self._build_column_groups()
         
         # 重置安全区域恢复状态
         self._last_obstacle_exit_x = None
@@ -338,6 +341,9 @@ class FormationRLEnv(gym.Env):
 
         # ===== 收缩阶段的队形约束（仅窄道模式） =====
         # 注意：安全区域不强制收敛，让RL自由决策避障方向
+        # 预先初始化安全区域标志（用于后续同排纵向协调）
+        is_in_safe_zone = False
+        
         if is_narrow_passage and not is_very_narrow:
             # 窄道模式：强制保持完美对称的2x2矩形队形
             # 核心思想：以通道中心为基准，完全对称压缩
@@ -451,6 +457,76 @@ class FormationRLEnv(gym.Env):
         dwa_fallback_count = 0  # 初始化DWA回退计数
         is_splitting, is_merging = self._check_center_obstacle(avg_x, distance=15.0)  # 中心障碍物检测
         
+        # ===== 安全区域：同排车辆纵向位置协调 =====
+        # 目标：让同排两车保持相同的x坐标，形成矩形而非平行四边形
+        safe_zone_row_alignment = {}  # key: car_idx, value: speed_factor (0-1, 1=正常, 0=停止)
+        if is_in_safe_zone and self._safe_zone_recover_alpha > 0.3:
+            # 在安全区域恢复期，协调同排车辆的纵向位置
+            for row in self._row_groups:
+                if len(row) < 2:
+                    continue
+                # 获取同排两车的x坐标
+                row_cars = [(idx, self.cars[idx].x) for idx in row]
+                row_cars.sort(key=lambda t: t[1])  # 按x排序
+                
+                # 计算x差异
+                x_diff = row_cars[-1][1] - row_cars[0][1]  # 最前车 - 最后车
+                
+                # 如果x差异过大(>0.5m)，让较快的车减速等待
+                if x_diff > 0.5:
+                    # 计算减速因子：差异越大，减速越多
+                    slow_factor = max(0.3, 1.0 - (x_diff - 0.5) / 1.5)
+                    # 较快的车（x较大）需要减速
+                    faster_car_idx = row_cars[-1][0]
+                    safe_zone_row_alignment[faster_car_idx] = slow_factor
+                elif x_diff > 0.2:
+                    # 小差异：轻微减速
+                    slow_factor = 0.7
+                    faster_car_idx = row_cars[-1][0]
+                    safe_zone_row_alignment[faster_car_idx] = slow_factor
+
+        # ===== 综合场景（s1_s2_s5_mixed）：上下两排纵向同步 =====
+        # 目标：通过障碍物时，上下两排车辆不要一前一后，而是尽量同步通过
+        # 实现方式：在接近或正在通过障碍物时，如果上排和下排整体x存在明显差异，
+        #           让领先的一排适度减速等待，避免长期“上慢下快”或相反的现象。
+        column_alignment = {}  # key: car_idx, value: speed_factor (0-1)
+        if self.scenario == "s1_s2_s5_mixed":
+            # 只有在附近存在障碍物时才启用（远离障碍物时不过度约束）
+            obstacle_ahead_dist = self._get_obstacle_ahead_distance(avg_x)
+            near_any_obstacle = (
+                obstacle_ahead_dist <= 15.0
+                or not is_in_safe_zone
+                or is_splitting
+                or is_merging
+            )
+
+            if near_any_obstacle and len(self._column_groups) >= 2:
+                # 计算每一排（上排/下排）的平均x
+                column_means = []
+                for col in self._column_groups:
+                    if not col:
+                        continue
+                    mean_x = float(np.mean([self.cars[idx].x for idx in col]))
+                    column_means.append((col, mean_x))
+
+                if len(column_means) >= 2:
+                    (col_a, mean_a), (col_b, mean_b) = column_means[0], column_means[1]
+                    diff = mean_a - mean_b  # >0 说明A整体领先
+                    gap = abs(diff)
+
+                    # 只有差异明显时才做处理，避免频繁小幅度震荡
+                    if gap > 0.4:
+                        # 领先的一排适度减速等待，另一排保持原有速度下限
+                        if diff > 0:
+                            ahead_col = col_a
+                        else:
+                            ahead_col = col_b
+
+                        # 差异越大，减速越多，但保留下限避免完全停住
+                        slow_factor = max(0.4, 1.0 - (gap - 0.4) / 2.0)
+                        for idx in ahead_col:
+                            column_alignment[idx] = slow_factor
+        
         for i, car in enumerate(self.cars):
             # 计算到前方最近队友的距离（窄道时用于减速避免追尾）
             front_teammate_dist = float('inf')
@@ -491,6 +567,17 @@ class FormationRLEnv(gym.Env):
                         if dy < 1.2 and dx < 1.5:
                             min_speed = min(min_speed, 0.5)  # 降低速度
                             break
+            
+            # ===== 安全区域：应用同排纵向协调的减速因子 =====
+            if i in safe_zone_row_alignment:
+                speed_factor = safe_zone_row_alignment[i]
+                # 降低min_speed，让较快的车减速等待同排队友
+                min_speed = min(min_speed, base_min_speed * speed_factor)
+
+            # 综合场景：应用上下排同步的减速因子（仅减速领先一排，不改变落后一排）
+            if i in column_alignment:
+                col_factor = column_alignment[i]
+                min_speed = min(min_speed, base_min_speed * col_factor)
             
             self.dwa_controllers[i].params.min_speed = min_speed
             
@@ -1366,6 +1453,25 @@ class FormationRLEnv(gym.Env):
             row_key = round(offset[0], 1)
             rows.setdefault(row_key, []).append(i)
         return list(rows.values())
+
+    def _build_column_groups(self) -> List[List[int]]:
+        """根据编队模板构建上下排分组（y>0为上排，y<0为下排）
+
+        说明：
+        - 用于综合场景(s1_s2_s5_mixed)中，上下两排车辆通过障碍物时的纵向同步控制
+        - 与_row_groups（前排/后排）正交，二者共同工作以形成稳定的2x2矩形队形
+        """
+        columns: Dict[int, List[int]] = {}
+        for i, offset in enumerate(self.formation_params.template_offsets):
+            # 1: 上排(y>0), -1: 下排(y<0), 0: 正中（目前未使用）
+            if offset[1] > 0:
+                col_key = 1
+            elif offset[1] < 0:
+                col_key = -1
+            else:
+                col_key = 0
+            columns.setdefault(col_key, []).append(i)
+        return list(columns.values())
 
     def _enforce_row_spacing(self, target_positions: np.ndarray) -> None:
         """确保同排车辆横向间距不小于安全距离"""

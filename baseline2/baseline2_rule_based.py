@@ -8,8 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 
-# 设置中文字体
-matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+# 设置字体为Arial
+matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 # Ensure project root is on path so we can reuse existing dynamics/DWA/Obstacle definitions
@@ -1082,13 +1082,13 @@ def run_single_narrow_test(
             print(f"  Step {step}, x={x:.1f}m: {cols}")
     print(f"\n结果: {'PASS - 无碰撞' if success else 'FAIL - 有碰撞'}")
     
-    # 绘图 - 缩短图片尺寸适合论文
-    fig, ax = plt.subplots(figsize=(8, 2.5))
+    # 绘图 - 调整尺寸比例与U-Trap图一致
+    fig, ax = plt.subplots(figsize=(8, 3.0))
     car_length = vehicle_params.car_length
     car_width = vehicle_params.car_width
     max_x = max(max(p[0] for p in t) for t in traj if t) + 3
     
-    ax.fill_between([0, max_x], [-road_half_width]*2, [road_half_width]*2, color='lightgray', alpha=0.3)
+    # 道路边界（不再填充灰色背景）
     ax.axhline(y=road_half_width, color='black', linestyle='--', linewidth=2)
     ax.axhline(y=-road_half_width, color='black', linestyle='--', linewidth=2)
     
@@ -1110,8 +1110,8 @@ def run_single_narrow_test(
     for i, t in enumerate(traj):
         if t:
             xs, ys = zip(*t)
-            # 轨迹用实线
-            ax.plot(xs, ys, color=colors[i], linestyle='-', label=f'Car {i}', linewidth=1.5, alpha=0.7)
+            # 轨迹用虚线
+            ax.plot(xs, ys, color=colors[i], linestyle='--', label=f'UGV {i}', linewidth=1.5, alpha=0.7)
             # 起点车辆
             ax.add_patch(Rectangle((xs[0]-car_length/2, ys[0]-car_width/2), car_length, car_width,
                                     facecolor=colors[i], alpha=0.9, edgecolor='black', zorder=5))
@@ -1127,13 +1127,15 @@ def run_single_narrow_test(
     ax.set_xlim(0, max_x + 1)
     ax.set_ylim(-road_half_width - 0.5, road_half_width + 0.5)
     ax.set_aspect('equal')
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_title(f'{gate_name}', fontweight='bold', fontsize=14)
-    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8)
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X (m)', fontsize=10)
+    ax.set_ylabel('Y (m)', fontsize=10)
+    ax.set_title(f'{gate_name}', fontsize=11)
+    # 图例放在图下方，水平排列（位置下移避免遮挡X轴）
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.35), ncol=4, fontsize=9, frameon=True)
+    ax.grid(True, alpha=0.35)
     
     plt.tight_layout()
+    plt.subplots_adjust(bottom=0.3)  # 为底部图例留出更多空间
     # 输出PDF和PNG
     plt.savefig(os.path.join(out_dir, f'single_gate_{gate_type}.pdf'), format='pdf', bbox_inches='tight')
     plt.savefig(os.path.join(out_dir, f'single_gate_{gate_type}.png'), dpi=150, bbox_inches='tight')

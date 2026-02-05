@@ -16,6 +16,11 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib
+
+# 设置字体为Arial
+matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
@@ -290,14 +295,13 @@ def plot_results(trajectories: dict, obstacles: List[Obstacle], goal_pos: Tuple[
     ax.scatter(goal_pos[0], goal_pos[1], c='gold', marker='*', s=250, label='Goal Point', zorder=5)
     
     # 设置图表样式
-    ax.set_title('U-Trap Escape Comparison', fontsize=16)
-    axis_fontsize = 12
-    ax.set_xlabel('X (m)', fontsize=axis_fontsize)
-    ax.set_ylabel('Y (m)', fontsize=axis_fontsize)
+    ax.set_title('U-Trap Escape Comparison', fontsize=11)
+    ax.set_xlabel('X (m)', fontsize=10)
+    ax.set_ylabel('Y (m)', fontsize=10)
     ax.set_aspect('equal', adjustable='box')
     ax.grid(True, linestyle=':', alpha=0.6)
     # 将图例放在图表下方
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=4, fontsize=axis_fontsize, frameon=True)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=4, fontsize=9, frameon=True)
     plt.subplots_adjust(bottom=0.3) # 为下方图例与x轴标签留出更多空间
     
     # 保存图像
