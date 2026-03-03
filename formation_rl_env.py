@@ -145,6 +145,14 @@ class FormationRLEnv(gym.Env):
         self.front_buffer_dist = 1.6
         self.follow_brake_dist = 2.8
 
+        # 理想队形前视距离（用于决定何时开始“预压缩/预变形”）
+        # 说明：DWA和窄道检测仍使用 narrow_lookahead（默认8m），
+        #       但理想队形只在更近的时候才收缩，避免像你图一那样在宽阔路段过早变成直线。
+        self.ideal_lookahead = self.narrow_lookahead
+        if scenario == "comprehensive_all":
+            # 综合场景：窄门/中心障碍较少，允许更靠近后再压缩
+            self.ideal_lookahead = 4.0
+
         # 极窄通道状态（用于跨门保持纵队）
         self._very_narrow_active = False
         self._very_narrow_seen = False
@@ -315,12 +323,29 @@ class FormationRLEnv(gym.Env):
         self._very_narrow_recover_alpha = recover_alpha
         
         # 优先级1修复：窄道时降低速度+增大前视，给横向调整更多时间
+        # 关键：不要“提前很远”就压缩/变形（会导致你看到的过早压缩），而是临近窄门才触发。
+        # 做法：用“近距离通道宽度”判断是否已经进入窄门/即将进入窄门，再决定是否启用窄道模式。
         upper_bound_global, lower_bound_global = self._get_passage_bounds(
             avg_x, lookahead=self.narrow_lookahead
         )
         passage_width_global = upper_bound_global - lower_bound_global
+
+        # 近距离通道（更保守，避免远处窄门导致提前变形）
+        upper_bound_near, lower_bound_near = self._get_passage_bounds(
+            avg_x, lookahead=2.5
+        )
+        passage_width_near = upper_bound_near - lower_bound_near
+
         formation_width = 1.6  # 原始队形宽度
-        is_narrow_passage = passage_width_global < formation_width + 0.5  # 通道<2.1m时触发
+        narrow_threshold = formation_width + 0.5  # 2.1m
+
+        # 估计到“最近障碍物”的距离，用于限制触发时机（只在临近时变形）
+        obstacle_ahead_dist = self._get_obstacle_ahead_distance(avg_x)
+        narrow_trigger_dist = 6.0  # 小于该距离才允许“即将窄门”触发压缩/变形
+
+        narrow_now = passage_width_near < narrow_threshold
+        narrow_soon = (passage_width_global < narrow_threshold) and (obstacle_ahead_dist < narrow_trigger_dist)
+        is_narrow_passage = narrow_now or narrow_soon
         
         # 检查恢复期
         recover_alpha_check = getattr(self, "_very_narrow_recover_alpha", 1.0)
@@ -345,28 +370,27 @@ class FormationRLEnv(gym.Env):
         is_in_safe_zone = False
         
         if is_narrow_passage and not is_very_narrow:
-            # 窄道模式：强制保持完美对称的2x2矩形队形
-            # 核心思想：以通道中心为基准，完全对称压缩
+            # 窄道模式：优先确保安全通过，降低队形强制要求
+            # 给车辆更多自由度，允许根据实际情况调整位置
             
-            # 1. 计算通道中心（障碍物场景通常中心在y=0）
+            # 1. 计算通道中心
             passage_center = (upper_bound_global + lower_bound_global) / 2
             
-            # 2. 队形中心 = 通道中心（不允许RL微调，确保完美对称）
-            formation_center = passage_center
-            
-            # 3. 计算压缩比例，确保队形能通过通道且保持矩形
-            # 使用有效通道宽度计算scale_factor
-            effective_width = passage_width_global - 0.3  # 安全余量
-            formation_original_width = 1.6  # 原始队形横向跨度
+            # 2. 计算压缩比例，但降低强制性
+            effective_width = passage_width_global - 0.4  # 增大安全余量到0.4m
+            formation_original_width = 1.6
             computed_scale = effective_width / formation_original_width
-            # 限制在[0.5, 1.0]范围内，确保矩形队形
-            scale_factor = np.clip(computed_scale, 0.5, 1.0)
+            scale_factor = np.clip(computed_scale, 0.4, 1.0)  # 允许更小压缩
             
-            # 4. 直接应用模板偏移 * 压缩比例 + 队形中心
-            # 确保完美对称：同符号的y偏移相等
+            # 3. 使用软约束而非硬约束，给车辆调整空间
+            # 只给建议位置，不强制定位
             for i in range(self.num_cars):
                 template_y = self.formation_params.template_offsets[i][1]
-                target_positions[i, 1] = formation_center + template_y * scale_factor
+                suggested_y = passage_center + template_y * scale_factor
+                # 软约束：70%建议位置 + 30%当前目标位置
+                target_positions[i, 1] = (
+                    target_positions[i, 1] * 0.3 + suggested_y * 0.7
+                )
         
         # 安全区域的队形控制（非窄道、非极窄时）
         elif not is_very_narrow:
@@ -393,16 +417,62 @@ class FormationRLEnv(gym.Env):
                 )
             
             if is_splitting_local or is_merging_local:
-                # 中心障碍物场景（分流或聚合）：让RL自由决策
-                # 但在聚合后期（is_merging且离障碍物较远时），逐步恢复队形
+                # 中心障碍物场景（分流或聚合）
+                # 优先目标：不撞车，完全通过所有障碍物
+                # 降低队形强制控制，给车辆更多自由度避障
+                lanes = self._get_center_obstacle_lanes(avg_x, distance=30.0)
+                if lanes is not None:
+                    lane_top, lane_bottom = lanes
+                    # 计算到最近中心障碍物的距离
+                    center_obstacle_dist = self._get_center_obstacle_distance(avg_x)
+                    
+                    # 只有在真正接近中心障碍物时才启用分流控制
+                    if center_obstacle_dist > 30.0:
+                        # 距离太远，不启用分流控制
+                        pass
+                    else:
+                        # 降低强制性，给车辆更多自由度避障
+                        # 只在非常接近时才给较强引导，其他时候只给轻微建议
+                        if center_obstacle_dist <= 0.0:
+                            # 车辆正处于障碍物区域内，给较强引导但不过度强制
+                            base_alpha = 0.7  # 从1.0降低到0.7
+                        elif center_obstacle_dist < 8.0:
+                            # 非常接近时，给中等强度引导
+                            base_alpha = 0.5 + 0.2 * (8.0 - center_obstacle_dist) / 8.0
+                        elif center_obstacle_dist < 15.0:
+                            # 中等距离，给轻微引导
+                            base_alpha = 0.3 + 0.2 * (15.0 - center_obstacle_dist) / 7.0
+                        else:
+                            # 距离较远，只给非常轻微的引导
+                            base_alpha = 0.2
+
+                        # 聚合期进一步降低控制，避免过度约束
+                        if is_merging_local:
+                            base_alpha *= 0.7  # 从0.9降低到0.7
+
+                        for i in range(self.num_cars):
+                            template_y = self.formation_params.template_offsets[i][1]
+                            # 上排模板(y>0)建议走上车道，下排模板(y<0)建议走下车道
+                            # 但不强制，允许车辆根据实际情况调整
+                            if template_y >= 0:
+                                lane_center = lane_top
+                            else:
+                                lane_center = lane_bottom
+                            current_target_y = target_positions[i, 1]
+                            target_positions[i, 1] = (
+                                current_target_y * (1 - base_alpha) + lane_center * base_alpha
+                            )
+
+                # 聚合后期：在离开障碍物一段距离后，逐步恢复到标准2×2矩形队形
                 if is_merging_local and self._safe_zone_recover_alpha > 0.3:
-                    # 聚合后期：开始恢复标准队形
                     merge_recover_alpha = (self._safe_zone_recover_alpha - 0.3) / 0.7
                     for i in range(self.num_cars):
                         template_y = self.formation_params.template_offsets[i][1]
                         current_target_y = target_positions[i, 1]
-                        target_positions[i, 1] = current_target_y * (1 - merge_recover_alpha) + template_y * merge_recover_alpha
-                # 否则不修改target_positions，完全依赖RL的输出
+                        target_positions[i, 1] = (
+                            current_target_y * (1 - merge_recover_alpha)
+                            + template_y * merge_recover_alpha
+                        )
             elif self._very_narrow_seen:
                 if recover_alpha < 1.0:
                     # 恢复期：逐步从纵队恢复到标准2x2矩形
@@ -486,18 +556,19 @@ class FormationRLEnv(gym.Env):
                     safe_zone_row_alignment[faster_car_idx] = slow_factor
 
         # ===== 综合场景（s1_s2_s5_mixed）：上下两排纵向同步 =====
-        # 目标：通过障碍物时，上下两排车辆不要一前一后，而是尽量同步通过
-        # 实现方式：在接近或正在通过障碍物时，如果上排和下排整体x存在明显差异，
-        #           让领先的一排适度减速等待，避免长期“上慢下快”或相反的现象。
+        # 暂时禁用或大幅降低此控制，优先确保不撞车通过所有障碍物
+        # 队形同步问题后续再解决
         column_alignment = {}  # key: car_idx, value: speed_factor (0-1)
-        if self.scenario == "s1_s2_s5_mixed":
+        # 暂时禁用上下排同步控制，避免过度约束导致撞车
+        enable_column_sync = False  # 可在后续实验中开启
+        if enable_column_sync and self.scenario == "s1_s2_s5_mixed" and not is_merging:
             # 只有在附近存在障碍物时才启用（远离障碍物时不过度约束）
+            # 聚合期禁用：避免在路径交叉时产生冲突
             obstacle_ahead_dist = self._get_obstacle_ahead_distance(avg_x)
             near_any_obstacle = (
                 obstacle_ahead_dist <= 15.0
                 or not is_in_safe_zone
                 or is_splitting
-                or is_merging
             )
 
             if near_any_obstacle and len(self._column_groups) >= 2:
@@ -528,9 +599,9 @@ class FormationRLEnv(gym.Env):
                             column_alignment[idx] = slow_factor
         
         for i, car in enumerate(self.cars):
-            # 计算到前方最近队友的距离（窄道时用于减速避免追尾）
+            # 计算到前方最近队友的距离（窄道/极窄/聚合期时用于减速避免追尾）
             front_teammate_dist = float('inf')
-            if is_narrow_passage or is_very_narrow:
+            if is_narrow_passage or is_very_narrow or is_merging:
                 # 使用虚拟x打破同排同x的并列，避免纵队阶段前后车重叠
                 virtual_x = car.x + i * 0.01
                 for j, other in enumerate(self.cars):
@@ -558,15 +629,50 @@ class FormationRLEnv(gym.Env):
                 # 超过1.5m不降低最小速度，保持队形紧凑
             # 聚合期（通过中心障碍物后）：需要更谨慎的速度控制
             if is_merging:
-                # 检查是否有其他车辆在横向较近的位置（可能路径交叉）
+                # 1. 检查前方队友距离，避免追尾
+                if front_teammate_dist < 1.0:
+                    min_speed = 0.0  # 前方队友太近，完全停止
+                elif front_teammate_dist < 2.0:
+                    min_speed = min(min_speed, 0.3)  # 前方队友较近，大幅减速
+                elif front_teammate_dist < 3.0:
+                    min_speed = min(min_speed, 0.5)  # 前方队友中等距离，适度减速
+                elif front_teammate_dist < 4.0:
+                    min_speed = min(min_speed, 0.7)  # 前方队友稍远，轻微减速
+                
+                # 2. 检查是否有其他车辆在横向较近的位置（可能路径交叉）
+                # 聚合期特别关注：上下两排车辆从两侧向中间聚合，容易发生交叉碰撞
                 for j, other in enumerate(self.cars):
-                    if j != i:
-                        dy = abs(other.y - car.y)
-                        dx = abs(other.x - car.x)
-                        # 横向较近且纵向也较近：可能在聚合中交叉
-                        if dy < 1.2 and dx < 1.5:
-                            min_speed = min(min_speed, 0.5)  # 降低速度
-                            break
+                    if j == i:
+                        continue
+                    dy = abs(other.y - car.y)
+                    dx = abs(other.x - car.x)
+                    dist_2d = np.sqrt(dx**2 + dy**2)
+                    
+                    # 聚合期的特殊判断：
+                    # - 如果车辆在y方向相反（一个在上，一个在下），且x方向接近，说明正在交叉
+                    # - 需要更严格的减速控制
+                    is_opposite_side = (car.y > 0 and other.y < 0) or (car.y < 0 and other.y > 0)
+                    
+                    if is_opposite_side and dx < 3.0 and dist_2d < 3.5:
+                        # 上下两排车辆正在交叉聚合，需要非常谨慎
+                        if dist_2d < 1.5:
+                            min_speed = 0.0  # 非常接近，完全停止
+                        elif dist_2d < 2.0:
+                            min_speed = min(min_speed, 0.15)  # 较近，几乎停止
+                        elif dist_2d < 2.5:
+                            min_speed = min(min_speed, 0.3)  # 中等距离，大幅减速
+                        else:
+                            min_speed = min(min_speed, 0.5)  # 稍远，适度减速
+                        break
+                    elif dy < 1.5 and dx < 2.0 and dist_2d < 2.5:
+                        # 同侧车辆，但距离较近
+                        if dist_2d < 1.5:
+                            min_speed = 0.0
+                        elif dist_2d < 2.0:
+                            min_speed = min(min_speed, 0.2)
+                        else:
+                            min_speed = min(min_speed, 0.4)
+                        break
             
             # ===== 安全区域：应用同排纵向协调的减速因子 =====
             if i in safe_zone_row_alignment:
@@ -619,7 +725,16 @@ class FormationRLEnv(gym.Env):
             else:
                 # 正常模式
                 lookahead = base_lookahead
-                if is_narrow_passage and not is_very_narrow:
+                if is_merging:
+                    # 聚合期：减小前视距离，让车辆更谨慎，避免路径交叉时碰撞
+                    # 根据前方队友距离动态调整
+                    if front_teammate_dist < 1.5:
+                        lookahead = 1.0  # 前方队友很近，大幅减小前视距离
+                    elif front_teammate_dist < 3.0:
+                        lookahead = 2.0  # 前方队友较近，适度减小前视距离
+                    else:
+                        lookahead = 2.5  # 前方队友较远，稍微减小前视距离
+                elif is_narrow_passage and not is_very_narrow:
                     # 窄道模式：使用同排协调的lookahead，保持矩形队形
                     row_key = self.formation_params.template_offsets[i][0]
                     if row_key in row_lookahead:
@@ -675,9 +790,11 @@ class FormationRLEnv(gym.Env):
                             teammate_radius = self.vehicle_params.car_radius + 0.05  # 0.32m，更宽松
                             predicted_y = target_positions[j, 1]
                         elif is_merging:
-                            # 聚合期：增大避碰半径，防止聚合时碰撞
-                            teammate_radius = self.vehicle_params.car_radius + 0.2  # 0.47m，更安全
-                            predicted_y = other.y
+                            # 聚合期：大幅增大避碰半径，防止聚合时碰撞
+                            # 优先安全，增大到0.4m，提供更大的安全余量
+                            teammate_radius = self.vehicle_params.car_radius + 0.4  # 0.67m，更安全
+                            # 使用预测位置（考虑目标位置），但也要考虑当前位置
+                            predicted_y = 0.7 * target_positions[j, 1] + 0.3 * other.y
                         else:
                             # 分流期和正常情况：正常避碰半径
                             teammate_radius = base_radius
@@ -759,7 +876,6 @@ class FormationRLEnv(gym.Env):
         # 远距离通道（15m内）- 用于提前规划
         upper_far, lower_far = self._get_passage_bounds(avg_x, lookahead=15.0)
         width_far = upper_far - lower_far
-        center_far = (upper_far + lower_far) / 2
         
         # 通道信息(8维)设计：
         # vector[16]: 近距离通道宽度（归一化）
@@ -922,9 +1038,13 @@ class FormationRLEnv(gym.Env):
         # 以领航点为基准
         positions = np.zeros((self.num_cars, 2))
         
-        # 检测前方通道（提前15m规划）
+        # 检测前方通道（用于理想队形规划）
+        # 说明：这里使用 ideal_lookahead（默认与 narrow_lookahead 相同），
+        #       在综合场景中我们将其调小到4m，避免在宽阔路段过早压缩/变成直线，
+        #       只在真正接近窄门/中心障碍时才开始压缩或变形。
         avg_x = np.mean([car.x for car in self.cars])
-        upper_bound, lower_bound = self._get_passage_bounds(avg_x, lookahead=self.narrow_lookahead)
+        lookahead_for_ideal = getattr(self, "ideal_lookahead", self.narrow_lookahead)
+        upper_bound, lower_bound = self._get_passage_bounds(avg_x, lookahead=lookahead_for_ideal)
         passage_width = upper_bound - lower_bound
         passage_center = (upper_bound + lower_bound) / 2
         
@@ -1028,12 +1148,16 @@ class FormationRLEnv(gym.Env):
     def _get_passage_bounds(self, current_x: float, lookahead: float = 10.0) -> Tuple[float, float]:
         """
         获取前方通道的上下边界（带缓存）
-        
-        处理三种情况：
-        1. 上方障碍物：限制upper_bound
-        2. 下方障碍物：限制lower_bound
-        3. 中间障碍物(y≈0)：不改变边界，让RL决定上下绕行
-        
+
+        关键修复：避免把“不同x位置”的上/下障碍物错误叠加为同一窄门。
+        旧逻辑会在较大lookahead下，把前方多个障碍物统一取最小/最大边界，
+        导致过早压缩（图一中提前塌缩成直线）的核心问题。
+
+        新逻辑：
+        1) 先找到前方最近的障碍物簇（最近起点 + 小窗口）
+        2) 只用该簇内障碍物计算通道边界
+        3) 中心障碍物(y≈0)仍不改边界，让RL决定上下绕行
+
         Returns:
             (upper_bound, lower_bound): 通道的上下边界y值
         """
@@ -1041,38 +1165,60 @@ class FormationRLEnv(gym.Env):
         cache_key = (round(current_x, 1), lookahead)
         if self._cache_step == self.step_count and cache_key in self._cached_passage_bounds:
             return self._cached_passage_bounds[cache_key]
+
         upper_bound = self.env_params.road_half_width
         lower_bound = -self.env_params.road_half_width
-        
+
+        # 先收集前方lookahead范围内障碍物（统一处理矩形/圆形）
+        candidates = []
         for obs in self.obstacles:
-            # 检查前方lookahead范围内的障碍物
-            if obs.x - obs.width/2 > current_x + lookahead or obs.x + obs.width/2 < current_x:
+            if obs.width > 0 and obs.height > 0:
+                obs_start = obs.x - obs.width / 2
+                obs_end = obs.x + obs.width / 2
+            else:
+                obs_start = obs.x - obs.radius
+                obs_end = obs.x + obs.radius
+
+            if obs_start > current_x + lookahead or obs_end < current_x:
                 continue
-            
+            candidates.append((obs, obs_start, obs_end))
+
+        # 无候选障碍物：返回完整道路边界
+        if not candidates:
+            self._cached_passage_bounds[cache_key] = (upper_bound, lower_bound)
+            return upper_bound, lower_bound
+
+        # 只考虑“最近障碍物簇”，避免远处/错位障碍物被错误合并
+        nearest_start = min(start for _, start, _ in candidates)
+        cluster_window = 3.0  # 同一簇在x方向允许的起点跨度
+        active_cluster = [
+            (obs, start, end)
+            for (obs, start, end) in candidates
+            if start <= nearest_start + cluster_window
+        ]
+
+        for obs, _, _ in active_cluster:
             if obs.width > 0 and obs.height > 0:
                 half_h = obs.height / 2
                 obs_top = obs.y + half_h
                 obs_bottom = obs.y - half_h
-                
-                # 判断障碍物位置：上方、下方、还是中间
-                # 中间障碍物(跨越y=0)需要特殊处理
-                is_center_obstacle = obs_bottom < 0.5 and obs_top > -0.5  # 障碍物跨越中心区域
-                
-                if is_center_obstacle:
-                    # 中间障碍物：不改变通道边界
-                    # 队形需要分成上下两部分绕行，由RL决定
-                    # 保持默认边界，让动态理想位置不收缩
-                    pass
-                elif obs.y > 0:
-                    # 上方障碍物：限制上边界
-                    upper_bound = min(upper_bound, obs_bottom - self.vehicle_params.car_radius)
-                else:
-                    # 下方障碍物：限制下边界
-                    lower_bound = max(lower_bound, obs_top + self.vehicle_params.car_radius)
-        
+            else:
+                obs_top = obs.y + obs.radius
+                obs_bottom = obs.y - obs.radius
+
+            # 中心障碍物：不改变通道边界（交给分流逻辑）
+            is_center_obstacle = obs_bottom < 0.5 and obs_top > -0.5
+            if is_center_obstacle:
+                continue
+
+            if obs.y > 0:
+                upper_bound = min(upper_bound, obs_bottom - self.vehicle_params.car_radius)
+            else:
+                lower_bound = max(lower_bound, obs_top + self.vehicle_params.car_radius)
+
         # 更新缓存
         self._cached_passage_bounds[cache_key] = (upper_bound, lower_bound)
-        
+
         return upper_bound, lower_bound
     
     
@@ -1385,6 +1531,50 @@ class FormationRLEnv(gym.Env):
                 min_dist = 0.0
         
         return min_dist
+    
+    def _get_center_obstacle_distance(self, current_x: float) -> float:
+        """
+        获取到前方最近中心障碍物的距离（只计算跨越y=0的中心障碍物）
+        
+        Returns:
+            距离（米），如果前方无中心障碍物则返回 float('inf')
+        """
+        min_dist = float('inf')
+        for obs in self.obstacles:
+            # 只处理中心障碍物（跨越y=0）
+            if obs.width > 0 and obs.height > 0:
+                obs_top = obs.y + obs.height / 2
+                obs_bottom = obs.y - obs.height / 2
+                is_center_obstacle = obs_bottom < 0.5 and obs_top > -0.5
+                if not is_center_obstacle:
+                    continue
+                obs_start_x = obs.x - obs.width / 2
+                obs_end_x = obs.x + obs.width / 2
+            elif obs.radius > 0:
+                # 圆形障碍物
+                obs_top = obs.y + obs.radius
+                obs_bottom = obs.y - obs.radius
+                is_center_obstacle = obs_bottom < 0.5 and obs_top > -0.5
+                if not is_center_obstacle:
+                    continue
+                obs_start_x = obs.x - obs.radius
+                obs_end_x = obs.x + obs.radius
+            else:
+                continue
+            
+            # 如果车队已经超过障碍物，跳过
+            if current_x > obs_end_x + 2.0:
+                continue
+            
+            # 计算到障碍物起始位置的距离
+            dist_to_obs = obs_start_x - current_x
+            if dist_to_obs > 0:
+                min_dist = min(min_dist, dist_to_obs)
+            elif current_x < obs_end_x:
+                # 当前在障碍物区域内
+                min_dist = 0.0
+        
+        return min_dist
 
     def _check_center_obstacle(self, current_x: float, distance: float = 15.0) -> Tuple[bool, bool]:
         """
@@ -1408,6 +1598,80 @@ class FormationRLEnv(gym.Env):
                     elif obs_end + 2.0 < current_x < obs_end + 20.0:
                         return (False, True)
         return (False, False)
+
+    def _get_center_obstacle_lanes(self, current_x: float, distance: float = 30.0) -> Optional[Tuple[float, float]]:
+        """
+        为中心障碍物场景计算"上车道/下车道"的目标y坐标（车道中心）
+
+        设计思路：
+        - 处理跨越 y=0 的中心障碍物（小/大中间障碍），支持矩形和圆形
+        - 上排车辆在 [障碍物上边界, 道路上边界] 之间取中点作为上车道中心
+        - 下排车辆在 [道路下边界, 障碍物下边界] 之间取中点作为下车道中心
+        - 返回距离当前x最近的中心障碍物的车道（而不是第一个找到的）
+        - 增大安全余量，确保车道中心距离障碍物有足够安全距离
+        """
+        road_hw = self.env_params.road_half_width
+        best_lanes = None
+        min_dist = float('inf')
+        
+        for obs in self.obstacles:
+            # 处理矩形障碍物
+            if obs.width > 0 and obs.height > 0:
+                obs_top = obs.y + obs.height / 2
+                obs_bottom = obs.y - obs.height / 2
+                obs_start = obs.x - obs.width / 2
+                obs_end = obs.x + obs.width / 2
+                obs_center_x = obs.x
+            # 处理圆形障碍物（小障碍物）
+            elif obs.radius > 0:
+                obs_top = obs.y + obs.radius
+                obs_bottom = obs.y - obs.radius
+                obs_start = obs.x - obs.radius
+                obs_end = obs.x + obs.radius
+                obs_center_x = obs.x
+            else:
+                continue
+
+            # 只处理跨越中心线的障碍物
+            is_center_obstacle = obs_bottom < 0.5 and obs_top > -0.5
+            if not is_center_obstacle:
+                continue
+
+            # 只在一定的x范围内启用（障碍物前后各distance米）
+            if current_x < obs_start - distance or current_x > obs_end + distance:
+                continue
+
+            # 计算到障碍物中心的距离（用于选择最近的障碍物）
+            dist_to_obs = abs(current_x - obs_center_x)
+            if dist_to_obs >= min_dist:
+                continue  # 不是最近的，跳过
+
+            # 计算可通行区域的上下边界，预留车辆半径和更大的安全余量
+            # 增大安全余量到0.5m，确保车辆有足够空间通过，避免贴边
+            margin = self.vehicle_params.car_radius + 0.5  # 从0.4增加到0.5，优先安全
+            
+            upper_min = obs_top + margin           # 上车道下边界
+            lower_max = obs_bottom - margin        # 下车道上边界
+
+            # 确保上车道和下车道有足够的空间（至少1.0m，确保车辆能安全通过）
+            min_lane_width = 1.0
+            if upper_min >= road_hw - min_lane_width / 2:
+                # 上车道空间不足，调整到道路边界附近
+                upper_min = road_hw - min_lane_width / 2
+            if lower_max <= -road_hw + min_lane_width / 2:
+                # 下车道空间不足，调整到道路边界附近
+                lower_max = -road_hw + min_lane_width / 2
+
+            # 车道中心分别取"可通行区"和道路边界的中点
+            # 但确保不会太靠近边界（至少留0.4m余量，从0.3增加到0.4）
+            lane_top_center = max((upper_min + road_hw) / 2.0, road_hw - 0.4)
+            lane_bottom_center = min((-road_hw + lower_max) / 2.0, -road_hw + 0.4)
+
+            # 更新最佳车道（最近的障碍物）
+            best_lanes = (lane_top_center, lane_bottom_center)
+            min_dist = dist_to_obs
+
+        return best_lanes
 
     def _build_very_narrow_segments(self) -> None:
         """预计算极窄通道区间，用于跨门保持纵队"""
